@@ -1,0 +1,7 @@
+*.elc
+*~
+.#*
+\#*#
+/coverage/
+/.deps/
+/.projectile-cache.eld
