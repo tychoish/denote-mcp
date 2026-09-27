@@ -4,7 +4,6 @@
 
 (require 'ert)
 (require 'cl-lib)
-(require 'test-helper)
 
 (require 'mcpkit)
 (require 'denote-mcp)
