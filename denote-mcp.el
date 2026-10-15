@@ -38,11 +38,6 @@
   :group 'mcpkit
   :prefix "denote-mcp-")
 
-(defcustom denote-mcp-port 8765
-  "Default TCP port for the Denote MCP service."
-  :type 'integer
-  :group 'denote-mcp)
-
 (defcustom denote-mcp-executed-keyword "x"
   "Filetag applied to mark a plan note as executed/implemented."
   :type 'string
@@ -293,9 +288,10 @@ Returns a list of change descriptions."
 (defvar denote-mcp-service
   (or (mcpkit-get-service 'denote)
       (mcpkit-define-service 'denote
-        :port denote-mcp-port
         :description "Denote Note-Taking and Knowledge Base Management"))
   "The Denote `mcpkit-service' instance.")
+
+(mcpkit-register-autostart 'denote :on-collision 'namespace)
 
 ;; 1. denote_find
 (mcpkit-register-tool 'denote_find 'denote
