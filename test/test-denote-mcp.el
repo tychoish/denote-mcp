@@ -197,7 +197,53 @@
         (let ((tree-res (funcall (mcpkit-tool-handler tree-tool)
                                  (list :root_sequence "1")
                                  (lambda (_status r) r))))
-          (should (= (plist-get tree-res :count) 3)))))))
+          (should (= (plist-get tree-res :count) 3)))
+
+        ;; Next sequence calculations
+        (let ((next-tool (gethash "denote_seq_get_next" (mcpkit-service-tools svc))))
+          ;; 1. Next child for sequence 1 (1a and 1b already exist -> 1c)
+          (let ((n1 (funcall (mcpkit-tool-handler next-tool)
+                             (list :target_sequence "1")
+                             (lambda (_status r) r))))
+            (should (equal (plist-get n1 :next_sequence) (denote-sequence-get-new 'child "1")))
+            (should (equal (plist-get n1 :relation) "child")))
+
+          ;; 2. Next sibling for sequence 1
+          (let ((n2 (funcall (mcpkit-tool-handler next-tool)
+                             (list :target_sequence "1" :type "sibling")
+                             (lambda (_status r) r))))
+            (should (equal (plist-get n2 :next_sequence) "2"))
+            (should (equal (plist-get n2 :relation) "sibling")))
+
+          ;; 3. Next parent when target_sequence is omitted
+          (let ((n3 (funcall (mcpkit-tool-handler next-tool)
+                             (list)
+                             (lambda (_status r) r))))
+            (should (equal (plist-get n3 :next_sequence) "2"))
+            (should (equal (plist-get n3 :relation) "parent"))))
+
+        ;; Reparent operations
+        (let ((rep-tool (gethash "denote_seq_reparent" (mcpkit-service-tools svc))))
+          ;; Create branch 2 and 2a
+          (funcall (mcpkit-tool-handler create-tool)
+                   (list :title "Branch Two" :sequence "2")
+                   (lambda (_status r) r))
+          (funcall (mcpkit-tool-handler create-tool)
+                   (list :title "Branch Two Child" :sequence "2a")
+                   (lambda (_status r) r))
+          ;; Reparent Branch Two under Root Note (sequence 1) recursively
+          (let ((rep-res (funcall (mcpkit-tool-handler rep-tool)
+                                  (list :source_slug "branch-two"
+                                        :new_parent_slug "root-note"
+                                        :recursive t)
+                                  (lambda (_status r) r))))
+            (should (equal (plist-get rep-res :status) "reparented_recursive"))
+            (should (file-exists-p (plist-get rep-res :source)))
+            ;; Child 2a must also have been recursively reparented under root sequence 1
+            (let ((tree-after (funcall (mcpkit-tool-handler tree-tool)
+                                       (list :root_sequence "1")
+                                       (lambda (_status r) r))))
+              (should (= (plist-get tree-after :count) 5)))))))))
 
 (ert-deftest test-denote-mcp/redate-and-links ()
   "Test `denote_redate' and repo-wide link rewriting."
@@ -298,6 +344,20 @@
            (setq call-resp resp)))
         (should (equal (plist-get call-resp :id) 3))
         (let* ((res (plist-get call-resp :result))
+               (content (plist-get res :content)))
+          (should (vectorp content))
+          (should (> (length content) 0))))
+
+      ;; Test tools/call request for denote_create_note with JSON array keywords
+      (let* ((create-req "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"denote_create_note\",\"arguments\":{\"title\":\"JSONRPC Created\",\"keywords\":[\"agent\",\"test\"],\"content\":\"Hello from JSONRPC\"}}}")
+             create-resp)
+        (mcpkit--handle-request-payload
+         create-req
+         active-services
+         (lambda (_status resp &rest _)
+           (setq create-resp resp)))
+        (should (equal (plist-get create-resp :id) 4))
+        (let* ((res (plist-get create-resp :result))
                (content (plist-get res :content)))
           (should (vectorp content))
           (should (> (length content) 0)))))))

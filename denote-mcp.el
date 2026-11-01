@@ -3,7 +3,7 @@
 ;; Author: Sam Kleinman <sam@tychoish.com>
 ;; Maintainer: Sam Kleinman <sam@tychoish.com>
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (mcpkit "0.1.0") (denote "3.0.0"))
+;; Package-Requires: ((emacs "29.1") (mcpkit "0.1.0") (denote "4.0.0") (denote-sequence "0.3.0") (denote-org "0.3.0"))
 ;; Homepage: https://github.com/tychoish/denote-mcp
 ;; Keywords: tools, mcp, denote, notes
 
@@ -24,12 +24,11 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'seq)
+(require 'org)
 (require 'mcpkit)
 (require 'denote)
-(require 'denote-sequence nil t)
-(require 'denote-dash nil t)
-(require 'denote-dash-repack nil t)
-(require 'denote-org nil t)
+(require 'denote-sequence)
+(require 'denote-org)
 
 ;;; Directory & Execution Environment
 
@@ -523,25 +522,40 @@ Returns a list of change descriptions."
 
 ;; 11. denote_seq_get_next
 (mcpkit-register-tool 'denote_seq_get_next 'denote
-  :description "Calculate the next available child or sibling sequence for a given parent/sibling sequence."
+  :description "Calculate the next available sequence (child or sibling for target_sequence or file_or_slug, or root parent sequence if omitted)."
   :input-schema '(:type "object"
-                  :properties (:target_sequence (:type "string" :description "Sequence string, e.g. '3a1'"))
-                  :required ["target_sequence"])
-  (let* ((seq (plist-get args :target_sequence)))
-    (unless (featurep 'denote-sequence)
-      (require 'denote-sequence nil t))
-    (let* ((has-children
-            (cl-some (lambda (s) (and (not (string= s seq)) (string-prefix-p seq s)))
-                     (denote-sequence-get-all-sequences-with-prefix seq)))
-           (next-seq (if has-children
-                         (denote-sequence-get-new 'child seq)
-                       (if (< (denote-sequence-depth seq) 3)
-                           (denote-sequence-get-new 'child seq)
-                         (denote-sequence-get-new 'sibling seq))))
-           (rel (if (string-prefix-p seq next-seq) "child" "sibling")))
-      (list :target_sequence seq
-            :next_sequence next-seq
-            :relation rel))))
+                  :properties (:target_sequence (:type "string" :description "Optional parent or sibling sequence string, e.g. '3a1'")
+                               :file_or_slug (:type "string" :description "Optional note file path or slug fragment to resolve sequence from")
+                               :type (:type "string" :enum ["parent" "child" "sibling"] :description "Optional sequence relation type"))
+                  :required [])
+  (let* ((target (plist-get args :file_or_slug))
+         (seq (or (plist-get args :target_sequence)
+                  (when (and target (not (string-empty-p target)))
+                    (when-let* ((file (denote-mcp--find-file target)))
+                      (plist-get (denote-mcp--parse-filename file) :seq)))))
+         (type-str (plist-get args :type))
+         (rel-type (when type-str (intern type-str))))
+    (if (and seq (not (string-empty-p seq)))
+        (let* ((has-children
+                (cl-some (lambda (s) (and (not (string= s seq)) (string-prefix-p seq s)))
+                         (denote-sequence-get-all-sequences-with-prefix seq)))
+               (next-seq (cond
+                          ((eq rel-type 'child) (denote-sequence-get-new 'child seq))
+                          ((eq rel-type 'sibling) (denote-sequence-get-new 'sibling seq))
+                          (has-children (denote-sequence-get-new 'child seq))
+                          ((< (denote-sequence-depth seq) 3)
+                           (denote-sequence-get-new 'child seq))
+                          (t (denote-sequence-get-new 'sibling seq))))
+               (rel (if (string-prefix-p seq next-seq) "child" "sibling")))
+          (list :target_sequence seq
+                :next_sequence next-seq
+                :relation rel))
+      (if (memq rel-type '(child sibling))
+          (error "Cannot calculate %s sequence without a target_sequence or file_or_slug" rel-type)
+        (let ((next-seq (denote-sequence-get-new 'parent)))
+          (list :target_sequence ""
+                :next_sequence next-seq
+                :relation "parent"))))))
 
 ;; 12. denote_seq_set
 (mcpkit-register-tool 'denote_seq_set 'denote
@@ -567,7 +581,7 @@ Returns a list of change descriptions."
                   :required ["pairs"])
   (let* ((pairs (plist-get args :pairs))
          (resolved
-          (cl-loop for pair across pairs
+          (cl-loop for pair in pairs
                    for slug = (plist-get pair :slug)
                    for new-seq = (plist-get pair :new_sequence)
                    for file = (denote-mcp--find-file slug)
@@ -606,13 +620,14 @@ Returns a list of change descriptions."
     (unless parent-file (error "Parent note not found: %s" parent))
     (denote-mcp-silently
      (let ((denote-sequence-scheme 'alphanumeric))
-       (if (and recursive (fboundp 'denote-dash-reparent-recursive))
-           (progn
-             (denote-dash-reparent-recursive src-file parent-file)
-             (list :status "reparented_recursive" :source src-file :new_parent parent-file))
-         (let* ((parent-seq (plist-get (denote-mcp--parse-filename parent-file) :seq))
-                (new-path (denote-sequence-reparent src-file parent-seq)))
-           (list :status "reparented" :source (or new-path src-file) :parent_sequence parent-seq)))))))
+       (denote-sequence-reparent src-file parent-file recursive)
+       (let* ((parent-seq (plist-get (denote-mcp--parse-filename parent-file) :seq))
+              (src-id (plist-get (denote-mcp--parse-filename src-file) :id))
+              (new-file (or (denote-mcp--find-file src-id) src-file)))
+         (list :status (if recursive "reparented_recursive" "reparented")
+               :source new-file
+               :new_parent parent-file
+               :parent_sequence parent-seq))))))
 
 ;; 15. denote_seq_tree
 (mcpkit-register-tool 'denote_seq_tree 'denote
