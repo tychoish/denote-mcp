@@ -290,8 +290,6 @@ Returns a list of change descriptions."
         :description "Denote Note-Taking and Knowledge Base Management"))
   "The Denote `mcpkit-service' instance.")
 
-(mcpkit-register-autostart 'denote :on-collision 'namespace)
-
 ;; 1. denote_find
 (mcpkit-register-tool 'denote_find 'denote
   :description "Find notes matching a regex across title, keywords, identifier, and sequence."
