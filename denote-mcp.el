@@ -3,7 +3,7 @@
 ;; Author: Sam Kleinman <sam@tychoish.com>
 ;; Maintainer: Sam Kleinman <sam@tychoish.com>
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (mcpkit "0.1.0") (denote "4.0.0") (denote-sequence "0.3.0") (denote-org "0.3.0"))
+;; Package-Requires: ((emacs "29.1") (mcpkit "0.1.0") (denote "4.0.0") (denote-sequence "0.3.0") (denote-org "0.3.0") (denote-convert "0.1.0") (denote-sync "0.2.0"))
 ;; Homepage: https://github.com/tychoish/denote-mcp
 ;; Keywords: tools, mcp, denote, notes
 
