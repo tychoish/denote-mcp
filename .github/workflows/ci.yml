@@ -30,14 +30,18 @@ jobs:
       - name: Install Markdown tree-sitter grammars
         shell: bash
         run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential
           emacs --batch -Q --eval '
           (progn
             (require (quote treesit))
             (setq treesit-language-source-alist
                   (quote ((markdown "https://github.com/tree-sitter-grammars/tree-sitter-markdown" "split_parser" "tree-sitter-markdown/src")
                           (markdown-inline "https://github.com/tree-sitter-grammars/tree-sitter-markdown" "split_parser" "tree-sitter-markdown-inline/src"))))
-            (treesit-install-language-grammar (quote markdown))
-            (treesit-install-language-grammar (quote markdown-inline)))'
+            (dolist (language (quote (markdown markdown-inline)))
+              (treesit-install-language-grammar language)
+              (unless (treesit-language-available-p language)
+                (error "Failed to install tree-sitter grammar: %s" language))))'
 
       - name: Run Tests
         uses: tychoish/elisp-ci@main
