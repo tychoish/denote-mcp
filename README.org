@@ -11,7 +11,7 @@ Instead of invoking shell-heavy =emacsclient --eval= subshells with brittle quot
 
 * Features
 
-- *19 Native MCP Tools*: Full lifecycle coverage spanning discovery, read, create, frontmatter synchronization, Folgezettel sequences, linking, dynamic block insertion, and backdating.
+- *20 Native MCP Tools*: Full lifecycle coverage spanning discovery, read, create, frontmatter synchronization, Folgezettel sequences, linking, dynamic block insertion, and backdating.
 - *Headless Safety*: All tools run inside ~denote-mcp-silently~, neutralizing interactive confirmation prompts (~y-or-n-p~, revert queries, coding system questions, and backlink guards).
 - *Folgezettel Hierarchy*: Deep integration with ~denote-sequence~ and ~denote-dash~ for subtree reparenting, gap verification, and collision-free grafting.
 - *Atomic Backdating*: ~denote_redate~ renames notes, updates frontmatter dates/identifiers, and safely rewrites all links across the knowledge base in a single call.
@@ -30,6 +30,7 @@ Instead of invoking shell-heavy =emacsclient --eval= subshells with brittle quot
 - ~denote_create_note~: Create a new note with title, tags, sequence signature, and body.
 - ~denote_append_body~: Append text safely to an existing note.
 - ~denote_rename~: Update title and/or keywords, rewriting frontmatter and renaming file on disk.
+- ~denote_convert_to_org~: Convert a Markdown YAML note and its body to Org, retaining its identifier and signature. Notes with additional YAML metadata are rejected to avoid losing it. Requires denote-convert, denote-sync, and the Markdown tree-sitter grammars.
 
 ** Folgezettel Sequence Management
 - ~denote_seq_get_next~: Compute next available child or sibling sequence slot.

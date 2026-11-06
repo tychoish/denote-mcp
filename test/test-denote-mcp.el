@@ -42,6 +42,7 @@
         (should (gethash "denote_create_note" tools))
         (should (gethash "denote_append_body" tools))
         (should (gethash "denote_rename" tools))
+        (should (gethash "denote_convert_to_org" tools))
         (should (gethash "denote_mark_executed" tools))
         (should (gethash "denote_sync_frontmatter" tools))
         (should (gethash "denote_seq_get_next" tools))
@@ -361,6 +362,82 @@
                (content (plist-get res :content)))
           (should (vectorp content))
           (should (> (length content) 0)))))))
+
+(ert-deftest test-denote-mcp/convert-markdown-to-org ()
+  "Convert metadata and body, preserving the source identifier and signature."
+  (test-mcpkit--with-temp-denote
+    (let* ((path (expand-file-name "20260101T120000==1a--sample__test.md" denote-directory))
+           (new (concat (file-name-sans-extension path) ".org"))
+           (tool (gethash "denote_convert_to_org" (mcpkit-service-tools (denote-mcp-register)))))
+      (with-temp-file path
+        (insert "---\ntitle: Sample\ndate: 2026-01-01\ntags: [test]\nidentifier: 20260101T120000\nsignature: 1a\n---\n\n# Heading\n\n| Name | Value |\n|---|---|\n| A | B |\n\n[Plan](denote:20260101T130000)\n"))
+      (let* ((visiting (find-file-noselect path))
+             (result (funcall (mcpkit-tool-handler tool) (list :file_or_slug path)
+                              (lambda (_status value) value))))
+        (should (equal (buffer-file-name visiting) new))
+        (kill-buffer visiting)
+        (should (equal (plist-get result :new_path) new))
+        (should (equal (plist-get result :identifier) "20260101T120000"))
+        (should-not (file-exists-p path))
+        (with-temp-buffer
+          (insert-file-contents new)
+          (should (search-forward "#+signature:  1a" nil t))
+          (should (search-forward "* Heading" nil t))
+          (should (search-forward "| A" nil t))
+          (should (search-forward "[[denote:20260101T130000][Plan]]" nil t)))))))
+
+(ert-deftest test-denote-mcp/convert-refuses-collision-and-unsaved-buffer ()
+  "Keep source and target unchanged if a collision or unsaved edit exists."
+  (test-mcpkit--with-temp-denote
+    (let* ((path (expand-file-name "20260101T120000--sample.md" denote-directory))
+           (new (concat (file-name-sans-extension path) ".org"))
+           (tool (gethash "denote_convert_to_org" (mcpkit-service-tools (denote-mcp-register))))
+           (handler (mcpkit-tool-handler tool)))
+      (with-temp-file path (insert "---\ntitle: Sample\nidentifier: 20260101T120000\n---\n\n# Text\n"))
+      (with-temp-file new (insert "existing"))
+      (should (stringp (funcall handler (list :file_or_slug path) (lambda (err _r) err))))
+      (delete-file new)
+      (let ((buffer (find-file-noselect path)))
+        (unwind-protect
+            (progn
+              (with-current-buffer buffer (goto-char (point-max)) (insert "unsaved"))
+              (should (stringp (funcall handler (list :file_or_slug path) (lambda (err _r) err))))
+              (should (file-exists-p path))
+              (should-not (file-exists-p new)))
+          (with-current-buffer buffer (set-buffer-modified-p nil))
+          (kill-buffer buffer))))))
+
+(ert-deftest test-denote-mcp/convert-rejects-extra-metadata ()
+  "Do not discard extra YAML metadata or accept malformed front matter."
+  (test-mcpkit--with-temp-denote
+    (let* ((path (expand-file-name "20260101T120000--sample.md" denote-directory))
+           (tool (gethash "denote_convert_to_org" (mcpkit-service-tools (denote-mcp-register))))
+           (handler (mcpkit-tool-handler tool)))
+      (dolist (content '("---\ntitle: Sample\ngdocs_id: abc\n---\n\n# Heading\n"
+                         "---\ntitle: Sample\n\n# Missing delimiter\n"
+                         "---\ntitle: Sample\ntitle: Other\n---\n\n# Heading\n"))
+        (with-temp-file path (insert content))
+        (should (stringp (funcall handler (list :file_or_slug path) (lambda (err _r) err))))
+        (should (equal (with-temp-buffer (insert-file-contents path) (buffer-string)) content))
+        (should-not (file-exists-p (concat (file-name-sans-extension path) ".org")))))))
+
+(ert-deftest test-denote-mcp/convert-refuses-concurrent-change ()
+  "Preserve source changes made during Markdown conversion."
+  (test-mcpkit--with-temp-denote
+    (require 'mdwn)
+    (let* ((path (expand-file-name "20260101T120000--sample.md" denote-directory))
+           (tool (gethash "denote_convert_to_org" (mcpkit-service-tools (denote-mcp-register))))
+           (original (symbol-function 'mdwn-to-org)))
+      (with-temp-file path
+        (insert "---\ntitle: Sample\nidentifier: 20260101T120000\n---\n\n# Heading\n"))
+      (cl-letf (((symbol-function 'mdwn-to-org)
+                 (lambda (body)
+                   (prog1 (funcall original body)
+                     (with-temp-buffer (insert "New data") (append-to-file (point-min) (point-max) path))))))
+        (should (stringp (funcall (mcpkit-tool-handler tool) (list :file_or_slug path)
+                                 (lambda (err _r) err)))))
+      (should (file-exists-p path))
+      (should-not (file-exists-p (concat (file-name-sans-extension path) ".org"))))))
 
 (provide 'test-denote-mcp)
 ;;; test-denote-mcp.el ends here

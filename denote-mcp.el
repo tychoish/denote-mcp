@@ -30,6 +30,13 @@
 (require 'denote-sequence)
 (require 'denote-org)
 
+(defvar mdwn-install-grammars)
+(defvar denote-convert-after-conversion-functions)
+(declare-function mdwn-to-org "mdwn" (markdown))
+(declare-function denote-convert-file-type "denote-convert" (file new-file-type))
+(declare-function denote-convert--front-matter-end "denote-convert" (file-type))
+(declare-function denote-sync--body-without-front-matter "denote-sync" (file))
+
 ;;; Directory & Execution Environment
 
 (defgroup denote-mcp nil
@@ -478,6 +485,90 @@ Returns a list of change descriptions."
              :new_path new-path
              :title (or new-title (denote-retrieve-title-value new-path (denote-filetype-heuristics new-path)))
              :keywords (or (denote-retrieve-filename-keywords-as-list new-path) []))))))
+
+;; Convert Markdown notes to Org, including their body.
+(mcpkit-register-tool 'denote_convert_to_org 'denote
+  :description "Convert a Denote Markdown YAML note and its body to Org, preserving its identifier and signature. Requires denote-convert and denote-sync with Markdown tree-sitter grammars."
+  :input-schema '(:type "object"
+                  :properties (:file_or_slug (:type "string" :description "Denote Markdown note path, identifier, or slug"))
+                  :required ["file_or_slug"])
+  (let* ((target (plist-get args :file_or_slug))
+         (file (denote-mcp--find-file target)))
+    (unless file (error "Note not found for: %s" target))
+    (unless (eq (denote-filetype-heuristics file) 'markdown-yaml)
+      (error "Expected a Denote Markdown YAML note: %s" file))
+    (unless (denote-retrieve-filename-identifier file)
+      (error "Note has no Denote identifier: %s" file))
+    (let ((visiting (get-file-buffer file))
+          (destination (concat (file-name-sans-extension file) ".org")))
+      (when (and visiting (buffer-modified-p visiting))
+        (error "Save the modified note before conversion: %s" file))
+      (when (file-exists-p destination)
+        (error "Destination already exists: %s" destination))
+      (require 'denote-convert)
+      (require 'denote-sync)
+      (require 'mdwn)
+      (denote-mcp-silently
+       (let* ((source-hash (with-temp-buffer
+                           (insert-file-contents-literally file)
+                           (secure-hash 'sha256 (current-buffer))))
+            (_validated
+             (with-temp-buffer
+               (insert-file-contents file)
+               (goto-char (point-min))
+               (unless (looking-at "^---[ \t]*$")
+                 (error "Missing YAML front matter: %s" file))
+               (forward-line 1)
+               (let (seen)
+                 (while (and (not (eobp)) (not (looking-at "^---[ \t]*$")))
+                   (unless (looking-at "^\\(title\\|date\\|tags\\|identifier\\|signature\\):[^\n]*$")
+                     (error "Unsupported YAML front matter; conversion would lose metadata: %s" file))
+                   (let ((key (match-string 1)))
+                     (when (member key seen) (error "Duplicate YAML field: %s" key))
+                     (push key seen))
+                   (forward-line 1)))
+               (when (eobp) (error "Unterminated YAML front matter: %s" file))))
+            (body (denote-sync--body-without-front-matter file))
+              (mdwn-install-grammars nil)
+              (converted (mdwn-to-org body))
+              (temp-dir (make-temp-file
+                         (expand-file-name ".denote-convert-" (file-name-directory file)) t))
+              (temp-source (expand-file-name (file-name-nondirectory file) temp-dir))
+              (temp-target (expand-file-name (file-name-nondirectory destination) temp-dir)))
+         (unwind-protect
+             (progn
+               (copy-file file temp-source)
+               (let ((denote-convert-after-conversion-functions nil))
+                 (denote-convert-file-type temp-source 'org))
+               (unless (file-exists-p temp-target)
+                 (error "Converted note has an unexpected filename"))
+               (with-current-buffer (find-file-noselect temp-target)
+                 (unwind-protect
+                     (progn
+                       (goto-char (point-min))
+                       (delete-region (denote-convert--front-matter-end 'org) (point-max))
+                       (goto-char (point-max))
+                       (insert "\n" converted "\n")
+                       (save-buffer))
+                   (kill-buffer (current-buffer))))
+               (unless (equal source-hash
+                              (with-temp-buffer
+                                (insert-file-contents-literally file)
+                                (secure-hash 'sha256 (current-buffer))))
+                 (error "Source changed during conversion: %s" file))
+               ;; Do not replace an existing target, even if it appeared during conversion.
+               (rename-file temp-target destination nil)
+               (condition-case err
+                   (delete-file file)
+                 (error (delete-file destination) (signal (car err) (cdr err))))
+               (when (buffer-live-p visiting)
+                 (with-current-buffer visiting
+                   (set-visited-file-name destination t t)
+                   (revert-buffer t t)))
+               (list :old_path file :new_path destination
+                     :identifier (denote-retrieve-filename-identifier destination)
+                     :file_type "org"))
+           (delete-directory temp-dir t)))))))
 
 ;; 9. denote_mark_executed
 (mcpkit-register-tool 'denote_mark_executed 'denote
