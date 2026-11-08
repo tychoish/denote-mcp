@@ -109,6 +109,28 @@
           (should (equal (plist-get mark-res :status) "marked"))
           (should (member "x" (plist-get mark-res :keywords))))))))
 
+(ert-deftest test-denote-mcp/targeted-append-and-vector-keywords ()
+  "Append at a custom ID and accept vector keywords in create and rename."
+  (test-mcpkit--with-temp-denote
+    (let* ((svc (denote-mcp-register))
+           (tools (mcpkit-service-tools svc))
+           (create (mcpkit-tool-handler (gethash "denote_create_note" tools)))
+           (append-body (mcpkit-tool-handler (gethash "denote_append_body" tools)))
+           (rename (mcpkit-tool-handler (gethash "denote_rename" tools)))
+           (note (funcall create
+                          (list :title "Targeted Test" :keywords ["agent" "plan"]
+                                :content "* Tasks\n:PROPERTIES:\n:CUSTOM_ID: tasks\n:END:\nOld\n* Other\nOther body\n")
+                          (lambda (_status result) result)))
+           (file (plist-get note :path)))
+      (funcall append-body (list :file_or_slug "targeted-test" :custom_id "tasks"
+                                 :content "New task\n") (lambda (_status result) result))
+      (with-temp-buffer
+        (insert-file-contents file)
+        (should (string-match-p "Old\nNew task\n\\* Other" (buffer-string))))
+      (let ((result (funcall rename (list :file_or_slug file :new_keywords ["review"])
+                             (lambda (_status value) value))))
+        (should (member "review" (plist-get result :keywords)))))))
+
 (ert-deftest test-denote-mcp/find-and-filter ()
   "Test `denote_find' and `denote_find_most_recent'."
   (test-mcpkit--with-temp-denote
@@ -445,6 +467,55 @@
                 (insert-file-contents path)
                 (search-forward "New data" nil t)))
       (should-not (file-exists-p (concat (file-name-sans-extension path) ".org"))))))
+
+(ert-deftest test-denote-mcp/json-dispatch-keywords ()
+  "Create a note with a JSON keyword array through the MCP dispatcher."
+  (test-mcpkit--with-temp-denote
+    (let ((svc (denote-mcp-register))
+          (payload (json-serialize
+                    (list :jsonrpc "2.0" :id 2 :method "tools/call"
+                          :params (list :name "denote_create_note"
+                                        :arguments (list :title "JSON Array Review"
+                                                         :keywords ["agent" "plan"])))))
+          status response)
+      (unwind-protect
+          (progn
+            (mcpkit--handle-request-payload
+             payload (list (cons svc 'error))
+             (lambda (s r &rest _) (setq status s response r)))
+            (should (eq status 'success))
+            (should-not (plist-get response :error))
+            (let ((files (directory-files temp-dir nil "json-array-review")))
+              (should (= (length files) 1))
+              (should (string-match-p "__agent_plan\\.org\\'" (car files)))))
+        (dolist (buffer (buffer-list))
+          (with-current-buffer buffer
+            (when (and buffer-file-name (string-prefix-p temp-dir buffer-file-name))
+              (set-buffer-modified-p nil)
+              (kill-buffer buffer))))))))
+
+(ert-deftest test-denote-mcp/targeted-append-rejects-invalid-targets ()
+  "Reject ambiguous, absent and non-Org targets without changing notes."
+  (test-mcpkit--with-temp-denote
+    (let* ((svc (denote-mcp-register))
+           (handler (mcpkit-tool-handler
+                     (gethash "denote_append_body" (mcpkit-service-tools svc))))
+           (org-file (expand-file-name "20260101T000000--sample.org" temp-dir))
+           (text-file (expand-file-name "20260101T000001--sample.txt" temp-dir))
+           (body "* Tasks\nFirst\n* Tasks\nSecond\n"))
+      (with-temp-file org-file (insert body))
+      (with-temp-file text-file (insert "Plain text\n"))
+      (seq-do (lambda (args)
+                (should (stringp (funcall handler args (lambda (err _value) err)))))
+              (list (list :file_or_slug org-file :target_heading "Tasks" :content "x")
+                    (list :file_or_slug org-file :target_heading "Missing" :content "x")
+                    (list :file_or_slug text-file :target_heading "Tasks" :content "x")))
+      (with-temp-buffer
+        (insert-file-contents org-file)
+        (should (equal (buffer-string) body)))
+      (with-temp-buffer
+        (insert-file-contents text-file)
+        (should (equal (buffer-string) "Plain text\n"))))))
 
 (provide 'test-denote-mcp)
 ;;; test-denote-mcp.el ends here

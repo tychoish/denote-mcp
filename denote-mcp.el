@@ -26,6 +26,7 @@
 (require 'seq)
 (require 'org)
 (require 'mcpkit)
+(require 'mcpkit-org)
 (require 'denote)
 (require 'denote-sequence)
 (require 'denote-org)
@@ -345,7 +346,7 @@ Returns a list of change descriptions."
   :description "Find the most recently authored note matching all specified tags (e.g. [\"agent\", \"plan\"])."
   :input-schema '(:type "object"
                   :properties (:tags (:type "array" :items (:type "string") :description "List of required tags")))
-  (let* ((tags (plist-get args :tags))
+  (let* ((tags (seq-into (plist-get args :tags) 'list))
          (files (denote-mcp--all-note-files))
          (matches
           (cl-remove-if-not
@@ -411,7 +412,7 @@ Returns a list of change descriptions."
                                :date (:type "string" :description "Optional date string YYYY-MM-DD"))
                   :required ["title"])
   (let* ((title (plist-get args :title))
-         (keywords (plist-get args :keywords))
+         (keywords (seq-into (plist-get args :keywords) 'list))
          (seq (plist-get args :sequence))
          (content (plist-get args :content))
          (file-type (intern (or (plist-get args :file_type) "org")))
@@ -441,24 +442,34 @@ Returns a list of change descriptions."
 
 ;; 7. denote_append_body
 (mcpkit-register-tool 'denote_append_body 'denote
-  :description "Append text content safely to an existing note without coding-system prompts."
+  :description "Append text to a note, optionally under an Org heading or custom ID."
   :input-schema '(:type "object"
                   :properties (:file_or_slug (:type "string" :description "File path or slug fragment")
-                               :content (:type "string" :description "Text content to append"))
+                               :content (:type "string" :description "Text content to append")
+                               :target_heading (:type "string" :description "Target Org heading")
+                               :custom_id (:type "string" :description "Target Org CUSTOM_ID"))
                   :required ["file_or_slug" "content"])
   (let* ((target (plist-get args :file_or_slug))
          (content (plist-get args :content))
+         (heading (plist-get args :target_heading))
+         (custom-id (plist-get args :custom_id))
          (file (denote-mcp--find-file target)))
     (unless file (error "Note not found for: %s" target))
-    (denote-mcp-silently
-     (with-current-buffer (find-file-noselect file)
-       (goto-char (point-max))
-       (unless (bolp) (insert "\n"))
-       (insert content)
-       (when (derived-mode-p 'org-mode)
-         (ignore-errors (org-element-cache-reset)))
-       (basic-save-buffer)
-       (list :path file :bytes_appended (length content))))))
+    (if (or heading custom-id)
+        (progn
+          (unless (string-equal (downcase (or (file-name-extension file) "")) "org")
+            (user-error "Targeted append requires an Org note: %s" file))
+          (mcpkit-org-append-entry file content :target-heading heading :custom-id custom-id)
+          (list :path file :bytes_appended (length content)))
+      (denote-mcp-silently
+       (with-current-buffer (find-file-noselect file)
+         (goto-char (point-max))
+         (unless (bolp) (insert "\n"))
+         (insert content)
+         (when (derived-mode-p 'org-mode)
+           (ignore-errors (org-element-cache-reset)))
+         (basic-save-buffer)
+         (list :path file :bytes_appended (length content)))))))
 
 ;; 8. denote_rename
 (mcpkit-register-tool 'denote_rename 'denote
@@ -470,7 +481,7 @@ Returns a list of change descriptions."
                   :required ["file_or_slug"])
   (let* ((target (plist-get args :file_or_slug))
          (new-title (plist-get args :new_title))
-         (new-kws (plist-get args :new_keywords))
+         (new-kws (seq-into (plist-get args :new_keywords) 'list))
          (file (denote-mcp--find-file target)))
     (unless file (error "Note not found for: %s" target))
     (denote-mcp-silently
@@ -668,7 +679,7 @@ Returns a list of change descriptions."
                                                             :new_sequence (:type "string"))
                                                :required ["slug" "new_sequence"])))
                   :required ["pairs"])
-  (let* ((pairs (plist-get args :pairs))
+  (let* ((pairs (seq-into (plist-get args :pairs) 'list))
          (resolved
           (cl-loop for pair in pairs
                    for slug = (plist-get pair :slug)

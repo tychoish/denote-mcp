@@ -28,7 +28,7 @@ Instead of invoking shell-heavy =emacsclient --eval= subshells with brittle quot
 - ~denote_get_metadata~: Retrieve structured metadata (id, sequence, title, tags, date, execution status).
 - ~denote_read_note~: Safely read note text content with UTF-8 encoding and optional byte truncation.
 - ~denote_create_note~: Create a new note with title, tags, sequence signature, and body.
-- ~denote_append_body~: Append text safely to an existing note.
+- ~denote_append_body~: Append text to a note.  For Org notes, ~target_heading~ or ~custom_id~ selects a unique heading; body text is inserted before its child headings.  Without a target, text is appended at the end of the note.
 - ~denote_rename~: Update title and/or keywords, rewriting frontmatter and renaming file on disk.
 - ~denote_convert_to_org~: Convert a Markdown YAML note and its body to Org, retaining its identifier and signature. Notes with additional YAML metadata are rejected to avoid losing it. Requires denote-convert, denote-sync, and the Markdown tree-sitter grammars.
 
@@ -50,6 +50,9 @@ Instead of invoking shell-heavy =emacsclient --eval= subshells with brittle quot
 - ~denote_mark_executed~: Mark a plan note as executed (~:x:~ tag, remove ~done~, update status).
 
 * Installation
+
+The installed ~mcpkit~ package must include ~mcpkit-org~.  Targeted
+appends use this module's Org insertion engine.
 
 Using ~use-package~ with ~package-vc~ (Emacs 29+):
 
