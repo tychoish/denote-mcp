@@ -433,7 +433,8 @@ IDENTIFIER may be:
 - nil: prefer LAST-CREATED (the file this session created most recently)
   when it still exists; otherwise the most recently modified note
   tagged with TAGS, via `denote-mcp--find-notes'.
-- a denote sequence signature (e.g. \"7a11c\"): `denote-mcp-common--find-by-sequence'.
+- a denote sequence signature (e.g. \"7a11c\"):
+  `denote-mcp-common--find-by-sequence'.
 - an absolute file path: returned as-is if it exists.
 - a slug fragment: `denote-mcp--find-file'.
 Signals an error if nothing resolves, rather than guessing.  Shared by
