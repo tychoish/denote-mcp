@@ -340,6 +340,7 @@
   "Test JSON-RPC 2.0 dispatch over `mcpkit--handle-request-payload'."
   (test-mcpkit--with-temp-denote
     (let* ((svc (denote-mcp-register))
+           (mcpkit-search-mode 'never)  ; the catalog exceeds the auto-gating threshold
            (active-services (list (cons svc 'error))))
       ;; Create a note directly first
       (let ((create-tool (gethash "denote_create_note" (mcpkit-service-tools svc))))

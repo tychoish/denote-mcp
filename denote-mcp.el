@@ -33,6 +33,7 @@
 
 (defvar mdwn-install-grammars)
 (defvar denote-convert-after-conversion-functions)
+(declare-function denote-mcp-notes-create "denote-mcp-notes" (args))
 (declare-function mdwn-to-org "mdwn" (markdown))
 (declare-function denote-convert-file-type "denote-convert" (file new-file-type))
 (declare-function denote-convert--front-matter-end "denote-convert" (file-type))
@@ -705,8 +706,13 @@ present, SEQUENCE an exact signature, PREFIX a signature prefix.  SORT is
                                :sequence (:type "string" :description "Optional Folgezettel sequence (e.g. '3a1')")
                                :content (:type "string" :description "Initial note content body")
                                :file_type (:type "string" :enum ["org" "markdown" "text"] :description "File type (default org)")
-                               :date (:type "string" :description "Optional date string YYYY-MM-DD"))
+                               :date (:type "string" :description "Optional date string YYYY-MM-DD")
+                               :type (:type "string" :enum ["plan" "report" "tracker"]
+                                            :description "Typed agent note: sets tags and template, and captures a standing TODO to agentic.org for plans and trackers")
+                               :sequence_or_parent (:type "string" :description "Typed notes only: parent signature (next child) or an unused exact signature"))
                   :required ["title"])
+  (if (plist-get args :type)
+      (denote-mcp-notes-create args)
   (let* ((title (plist-get args :title))
          (keywords (seq-into (plist-get args :keywords) 'list))
          (seq (plist-get args :sequence))
@@ -732,7 +738,7 @@ present, SEQUENCE an exact signature, PREFIX a signature prefix.  SORT is
                :id (plist-get meta :id)
                :sequence (plist-get meta :signature)
                :title (plist-get meta :title)
-               :keywords (plist-get meta :filetags)))))))
+               :keywords (plist-get meta :filetags))))))))
 
 ;; 7. denote_append_body
 (mcpkit-register-tool 'denote_append_body 'denote
@@ -741,7 +747,11 @@ present, SEQUENCE an exact signature, PREFIX a signature prefix.  SORT is
                   :properties (:file_or_slug (:type "string" :description "File path or slug fragment")
                                :content (:type "string" :description "Text content to append")
                                :target_heading (:type "string" :description "Target Org heading")
-                               :custom_id (:type "string" :description "Target Org CUSTOM_ID"))
+                               :custom_id (:type "string" :description "Target Org CUSTOM_ID")
+                               :headline_title (:type "string" :description "Add content under a new child heading with this title")
+                               :todo_state (:type "string" :description "TODO keyword for the new child heading")
+                               :priority (:type "string" :description "Priority for the new child heading")
+                               :properties (:type "object" :description "Properties for the new child heading"))
                   :required ["file_or_slug" "content"])
   (let* ((target (plist-get args :file_or_slug))
          (content (plist-get args :content))
@@ -749,11 +759,15 @@ present, SEQUENCE an exact signature, PREFIX a signature prefix.  SORT is
          (custom-id (plist-get args :custom_id))
          (file (denote-mcp--find-file target)))
     (unless file (error "Note not found for: %s" target))
-    (if (or heading custom-id)
+    (if (or heading custom-id (plist-get args :headline_title))
         (progn
           (unless (string-equal (downcase (or (file-name-extension file) "")) "org")
             (user-error "Targeted append requires an Org note: %s" file))
-          (mcpkit-org-append-entry file content :target-heading heading :custom-id custom-id)
+          (mcpkit-org-append-entry file content :target-heading heading :custom-id custom-id
+                                   :headline-title (plist-get args :headline_title)
+                                   :todo-state (plist-get args :todo_state)
+                                   :priority (plist-get args :priority)
+                                   :properties (plist-get args :properties))
           (list :path file :bytes_appended (length content)))
       (denote-mcp-silently
        (with-current-buffer (find-file-noselect file)
@@ -1352,4 +1366,8 @@ Kept for backward compatibility."
   denote-mcp-service)
 
 (provide 'denote-mcp)
+
+;; Plan, report and tracker tools register on the same service.
+(require 'denote-mcp-notes)
+
 ;;; denote-mcp.el ends here
