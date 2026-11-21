@@ -365,8 +365,7 @@ The caller rewrites links afterwards, so denote's backlink guard is disabled."
   "Return the members of FILES whose contents include the fixed STRING.
 One `grep -F' process is used when available; otherwise FILES are read into a
 single reused buffer."
-  (if-let* ((grep (executable-find "grep"))
-            (_ files))
+  (if-let* ((grep (and files (executable-find "grep"))))
       (with-temp-buffer
         (let ((default-directory (denote-mcp-get-directory)))
           ;; Chunk the arguments to stay below ARG_MAX on huge trees.
