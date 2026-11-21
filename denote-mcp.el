@@ -75,23 +75,169 @@ prompts, large-file warnings, and UTF-8 encoding prompts."
            (denote-save-buffers t))
        ,@body)))
 
-;;; Helper Functions
+;;; Note Index (cached, filename-derived)
+
+(defcustom denote-mcp-sequence-scheme nil
+  "Folgezettel sequence scheme the sequence tools bind, or nil.
+When nil the tools use the ambient `denote-sequence-scheme'; only
+`denote_seq_reparent' falls back to `alphanumeric'."
+  :type '(choice (const :tag "Ambient denote-sequence-scheme" nil)
+                 (const alphanumeric) (const numeric))
+  :group 'denote-mcp)
+
+(defmacro denote-mcp-mutating (&rest body)
+  "Run BODY like `denote-mcp-silently', then drop the cached note index."
+  (declare (indent 0))
+  `(unwind-protect (denote-mcp-silently ,@body)
+     (denote-mcp-invalidate-cache)))
+
+(cl-defstruct (denote-mcp--note (:constructor denote-mcp--note-create))
+  "Filename-derived facts about one note."
+  path id seq slug keywords ext)
+
+(defvar denote-mcp--cache nil
+  "Cached note index as (KEY . NOTES), see `denote-mcp--notes'.")
+
+(defun denote-mcp-invalidate-cache ()
+  "Forget the cached note index."
+  (setq denote-mcp--cache nil))
+
+(defconst denote-mcp--filename-rx
+  (rx bos (group (= 8 digit) "T" (= 6 digit))
+      (? "==" (group (+ (not (any "-_.")))))
+      (? "--" (group (* (not (any "_.")))))
+      (? "__" (group (* (not (any "."))))) "." (group (+ nonl)) eos)
+  "Match a standard denote file name: ID, signature, slug, keywords, extension.")
+
+(defun denote-mcp--note-from-path (file)
+  "Return a `denote-mcp--note' for FILE parsed from its name, or nil."
+  (let ((base (file-name-nondirectory file)))
+    (if (string-match denote-mcp--filename-rx base)
+        ;; Read every group before `split-string' clobbers the match data.
+        (let ((id (match-string 1 base)) (seq (match-string 2 base))
+              (slug (match-string 3 base)) (kw (match-string 4 base))
+              (ext (match-string 5 base)))
+          (denote-mcp--note-create
+           :path file :id id :seq seq :slug slug
+           :keywords (when kw (split-string kw "_" t))
+           :ext ext))
+      (when-let* ((id (denote-retrieve-filename-identifier base)))
+        (denote-mcp--note-create
+         :path file :id id :seq (denote-retrieve-filename-signature base)
+         :slug (denote-retrieve-filename-title base)
+         :keywords (denote-retrieve-filename-keywords-as-list base)
+         :ext (file-name-extension base))))))
+
+(defun denote-mcp--dir-key (dir)
+  "Return a key that changes when notes are added, removed or renamed in DIR.
+It holds the modification times of DIR and its immediate subdirectories."
+  (let ((key (list (cons dir (file-attribute-modification-time (file-attributes dir))))))
+    (dolist (entry (directory-files-and-attributes dir t "\\`[^.]" t))
+      (when (eq (file-attribute-type (cdr entry)) t)
+        (push (cons (car entry) (file-attribute-modification-time (cdr entry))) key)))
+    key))
+
+(defun denote-mcp--notes (&optional regexp)
+  "Return `denote-mcp--note' structs for all notes, optionally matching REGEXP.
+REGEXP is matched against the path relative to the denote directory.  The
+full index is cached and revalidated by directory modification times, so
+repeated calls avoid rescanning the tree."
+  (let* ((dir (denote-mcp-get-directory))
+         (key (denote-mcp--dir-key dir))
+         (notes (if (equal key (car denote-mcp--cache))
+                    (cdr denote-mcp--cache)
+                  (let* ((denote-directory dir)
+                         (files (if (fboundp 'denote-directory-files)
+                                    (denote-directory-files nil nil t)
+                                  (directory-files-recursively
+                                   dir "\\`[0-9]\\{8\\}T[0-9]\\{6\\}.*\\.\\(org\\|md\\|txt\\)\\'")))
+                         (built (delq nil (mapcar #'denote-mcp--note-from-path files))))
+                    (setq denote-mcp--cache (cons key built))
+                    built))))
+    (if regexp
+        (let ((skip (length dir)))
+          (seq-filter (lambda (n)
+                        (let ((path (denote-mcp--note-path n)))
+                          ;; Cheaper than `file-relative-name' for the common case.
+                          (string-match-p regexp (if (string-prefix-p dir path)
+                                                     (substring path skip)
+                                                   (file-relative-name path dir)))))
+                      notes))
+      notes)))
 
 (defun denote-mcp--all-note-files (&optional regexp)
-  "Return list of all regular denote note files matching optional REGEXP.
-Uses `denote-directory-files' when available, otherwise scans primary
-directory and journal/ subdirectory."
-  (let* ((denote-dir (denote-mcp-get-directory))
-         (denote-directory denote-dir))
-    (if (fboundp 'denote-directory-files)
-        (denote-directory-files regexp nil t)
-      (let* ((journal-dir (expand-file-name "journal/" denote-dir))
-             (rx (or regexp "\\`[0-9]\\{8\\}T[0-9]\\{6\\}.*\\.\\(org\\|md\\|txt\\)\\'"))
-             (top (when (file-directory-p denote-dir)
-                    (directory-files denote-dir t rx)))
-             (jrn (when (file-directory-p journal-dir)
-                    (directory-files journal-dir t rx))))
-        (seq-filter #'file-regular-p (append top jrn))))))
+  "Return list of all regular denote note files matching optional REGEXP."
+  (mapcar #'denote-mcp--note-path (denote-mcp--notes regexp)))
+
+(defun denote-mcp--sequences ()
+  "Return all sequence signatures of the notes, as a list of strings."
+  (delq nil (mapcar #'denote-mcp--note-seq (denote-mcp--notes))))
+
+(defmacro denote-mcp--with-scheme (&rest body)
+  "Run BODY with `denote-sequence-scheme' set to `denote-mcp-sequence-scheme'."
+  (declare (indent 0))
+  `(let ((denote-sequence-scheme (or denote-mcp-sequence-scheme denote-sequence-scheme)))
+     ,@body))
+
+(defun denote-mcp--insert-head (file &optional bytes)
+  "Insert the first BYTES (default 2048) of FILE into the current buffer.
+File name handlers, coding detection and change hooks are bypassed: this is
+several times faster than a plain `insert-file-contents' when reading many
+files, and notes are UTF-8."
+  (let ((file-name-handler-alist nil)
+        (coding-system-for-read 'utf-8-unix)
+        (inhibit-modification-hooks t))
+    (insert-file-contents file nil 0 (or bytes 2048))))
+
+(defun denote-mcp--head (file &optional bytes)
+  "Return the first BYTES (default 2048) of FILE as a string."
+  (with-temp-buffer
+    (denote-mcp--insert-head file bytes)
+    (buffer-string)))
+
+(defun denote-mcp--title (file &optional fallback)
+  "Return FILE's title from its front matter, else FALLBACK or its slug.
+Reads only the head of the file."
+  (or (let ((head (denote-mcp--head file 1024))
+            (case-fold-search t))
+        (cond
+         ((string-match "^#\\+title:[ \t]*\\(.+?\\)[ \t]*$" head)
+          (match-string 1 head))
+         ((string-match "^title:[ \t]*\"?\\([^\"\n]+?\\)\"?[ \t]*$" head)
+          (match-string 1 head))))
+      fallback
+      (when-let* ((n (denote-mcp--note-from-path file))) (denote-mcp--note-slug n))))
+
+(defun denote-mcp--summary (note)
+  "Return the common result plist describing NOTE (a `denote-mcp--note')."
+  (let ((file (denote-mcp--note-path note)))
+    (list :id (denote-mcp--note-id note)
+          :sequence (denote-mcp--note-seq note)
+          :title (denote-mcp--title file (denote-mcp--note-slug note))
+          :keywords (or (denote-mcp--note-keywords note) [])
+          :path file)))
+
+(defmacro denote-mcp--with-visited (file &rest body)
+  "Run BODY in a buffer visiting FILE, killing the buffer afterwards if new."
+  (declare (indent 1))
+  `(let* ((--f ,file)
+          (--existing (get-file-buffer --f))
+          ;; `find-file-noselect' also reverts an unmodified stale buffer.
+          (--buf (find-file-noselect --f)))
+     (unwind-protect (with-current-buffer --buf ,@body)
+       (when (and (not --existing) (buffer-live-p --buf)
+                  (not (buffer-modified-p --buf)))
+         (kill-buffer --buf)))))
+
+;;; Helper Functions
+
+(defun denote-mcp--parent-sequence (seq)
+  "Return the implied parent of sequence SEQ, or nil for a root sequence.
+Components are split by `denote-sequence-split', so multi-digit parts such as
+\"3a10\" are handled."
+  (when-let* ((parts (ignore-errors (denote-sequence-split seq)))
+              ((> (length parts) 1)))
+    (denote-sequence-join (butlast parts) denote-sequence-scheme)))
 
 (defun denote-mcp--find-file (file-or-slug)
   "Resolve FILE-OR-SLUG to an absolute file path in denote directory.
@@ -116,13 +262,12 @@ filtering out backup, lock, and autosave files."
 (defun denote-mcp--parse-filename (file)
   "Parse denote FILE into a plist :id, :seq, :title, :keywords, :ext."
   (when (stringp file)
-    (let ((f (file-name-nondirectory file)))
-      (when-let* ((id (denote-retrieve-filename-identifier f)))
-        (list :id id
-              :seq (denote-retrieve-filename-signature f)
-              :title (denote-retrieve-filename-title f)
-              :keywords (or (denote-retrieve-filename-keywords-as-list f) [])
-              :ext (file-name-extension f))))))
+    (when-let* ((n (denote-mcp--note-from-path file)))
+      (list :id (denote-mcp--note-id n)
+            :seq (denote-mcp--note-seq n)
+            :title (denote-mcp--note-slug n)
+            :keywords (or (denote-mcp--note-keywords n) [])
+            :ext (denote-mcp--note-ext n)))))
 
 (defun denote-mcp--get-metadata (file)
   "Extract structured frontmatter and file metadata from FILE."
@@ -164,29 +309,31 @@ If SEQ is nil or empty, removes any existing signature."
   (let ((path (denote-mcp--find-file file)))
     (unless (and path (file-exists-p path))
       (error "File not found: %s" file))
-    (denote-mcp-silently
-     (let ((buf (find-file-noselect path)))
-       (with-current-buffer buf
-         ;; Remove existing signature lines
+    (denote-mcp-mutating
+     (denote-mcp--with-visited path
+       ;; Remove existing signature lines
+       (goto-char (point-min))
+       (while (re-search-forward "^#\\+signature:.*\\n?" nil t)
+         (delete-region (match-beginning 0) (match-end 0)))
+       ;; Insert new signature if non-empty
+       (when (and seq (not (string-empty-p seq)))
          (goto-char (point-min))
-         (while (re-search-forward "^#\\+signature:.*\\n?" nil t)
-           (delete-region (match-beginning 0) (match-end 0)))
-         ;; Insert new signature if non-empty
-         (when (and seq (not (string-empty-p seq)))
+         (if (re-search-forward "^#\\+identifier:.*$" nil t)
+             (progn (end-of-line) (insert "\n#+signature: " seq))
            (goto-char (point-min))
-           (if (re-search-forward "^#\\+identifier:.*$" nil t)
-               (progn (end-of-line) (insert "\n#+signature: " seq))
-             (goto-char (point-min))
-             (while (and (not (eobp)) (looking-at "^#\\+"))
-               (forward-line 1))
-             (beginning-of-line)
-             (insert "#+signature: " seq "\n")))
-         (save-buffer)
-         (denote-rename-file-using-front-matter path)
-         (buffer-file-name))))))
+           (while (and (not (eobp)) (looking-at "^#\\+"))
+             (forward-line 1))
+           (beginning-of-line)
+           (insert "#+signature: " seq "\n")))
+       (save-buffer)
+       (denote-rename-file-using-front-matter path)
+       (buffer-file-name)))))
+
+(defvar denote-file-has-backlinks-function)
 
 (defun denote-mcp--set-identifier (file new-id)
-  "Change FILE's #+identifier: to NEW-ID (YYYYMMDDTHHMMSS) and rename."
+  "Change FILE's #+identifier: to NEW-ID (YYYYMMDDTHHMMSS) and rename.
+The caller rewrites links afterwards, so denote's backlink guard is disabled."
   (let ((path (denote-mcp--find-file file)))
     (unless (and path (file-exists-p path))
       (error "File not found: %s" file))
@@ -197,10 +344,12 @@ If SEQ is nil or empty, removes any existing signature."
                                        (substring new-id 0 4) (substring new-id 4 6) (substring new-id 6 8)
                                        (substring new-id 9 11) (substring new-id 11 13) (substring new-id 13 15)))))
            (date-str (format-time-string "[%Y-%m-%d %a %H:%M]" time)))
-      (denote-mcp-silently
-       (cl-letf (((symbol-function 'denote--file-has-backlinks-p) (lambda (&rest _) nil)))
-         (let ((buf (find-file-noselect path)))
-           (with-current-buffer buf
+      (denote-mcp-mutating
+       ;; `denote--file-has-backlinks-p' guarded older denote; newer denote
+       ;; reads `denote-file-has-backlinks-function'.
+       (let ((denote-file-has-backlinks-function #'ignore))
+         (cl-letf (((symbol-function 'denote--file-has-backlinks-p) (lambda (&rest _) nil)))
+           (denote-mcp--with-visited path
              (goto-char (point-min))
              (if (re-search-forward "^#\\+identifier:.*$" nil t)
                  (replace-match (concat "#+identifier: " new-id))
@@ -212,83 +361,231 @@ If SEQ is nil or empty, removes any existing signature."
              (denote-rename-file-using-front-matter path)
              (buffer-file-name))))))))
 
+(defun denote-mcp--files-containing (string files)
+  "Return the members of FILES whose contents include the fixed STRING.
+One `grep -F' process is used when available; otherwise FILES are read into a
+single reused buffer."
+  (if-let* ((grep (executable-find "grep"))
+            (_ files))
+      (with-temp-buffer
+        (let ((default-directory (denote-mcp-get-directory)))
+          ;; Chunk the arguments to stay below ARG_MAX on huge trees.
+          (dolist (chunk (seq-partition files 400))
+            (apply #'process-file grep nil t nil "-lFZ" "-e" string "--" chunk)))
+        (split-string (buffer-string) "\0" t))
+    (with-temp-buffer
+      (let ((file-name-handler-alist nil)
+            (coding-system-for-read 'utf-8-unix)
+            (inhibit-modification-hooks t))
+        (seq-filter (lambda (f)
+                      (erase-buffer)
+                      (insert-file-contents f)
+                      (goto-char (point-min))
+                      (search-forward string nil t))
+                    files)))))
+
+(defun denote-mcp--git-grep-files (string dir)
+  "Return absolute paths of files tracked by the git repo around DIR with STRING."
+  (when-let* ((root (locate-dominating-file dir ".git"))
+              (default-directory root))
+    (with-temp-buffer
+      (when (zerop (process-file "git" nil '(t nil) nil "grep" "-lFz" "-e" string))
+        (mapcar (lambda (f) (expand-file-name f root))
+                (split-string (buffer-string) "\0" t))))))
+
 (defun denote-mcp--replace-links (old-id new-id &optional files)
-  "Replace occurrences of OLD-ID with NEW-ID across denote files."
-  (let* ((target-files (or files (denote-mcp--all-note-files)))
+  "Replace occurrences of OLD-ID with NEW-ID across denote files.
+FILES limits the search to those paths.  Only files that actually contain
+OLD-ID are visited.  Return the number of
+replacements."
+  (let* ((candidates (or files (denote-mcp--all-note-files)))
+         (target-files (denote-mcp--files-containing
+                        old-id (seq-filter #'file-exists-p candidates)))
          (count 0))
-    (denote-mcp-silently
+    (denote-mcp-mutating
      (dolist (path target-files)
-       (when (file-exists-p path)
-         (with-current-buffer (find-file-noselect path)
-           (goto-char (point-min))
-           (while (search-forward old-id nil t)
-             (replace-match new-id t t)
-             (cl-incf count))
-           (when (buffer-modified-p)
-             (when (derived-mode-p 'org-mode)
-               (ignore-errors (org-element-cache-reset)))
-             (save-buffer))))))
+       (denote-mcp--with-visited path
+         (goto-char (point-min))
+         (while (search-forward old-id nil t)
+           (replace-match new-id t t)
+           (cl-incf count))
+         (when (buffer-modified-p)
+           (when (derived-mode-p 'org-mode)
+             (ignore-errors (org-element-cache-reset)))
+           (save-buffer)))))
     count))
 
+;;; Frontmatter synchronization
+
+(defun denote-mcp--md-frontmatter-bounds ()
+  "Return (START . END) of the YAML front matter of the current buffer, or nil."
+  (save-excursion
+    (goto-char (point-min))
+    (when (looking-at "---[ \t]*\n")
+      (let ((start (match-end 0)))
+        (goto-char start)
+        (when (re-search-forward "^---" nil t)
+          (cons start (line-beginning-position)))))))
+
+(defun denote-mcp--md-get (key bounds)
+  "Return KEY's value within BOUNDS, accepting `key: v' and `#+key: v' forms."
+  (save-excursion
+    (goto-char (car bounds))
+    (when (re-search-forward (format "^#?\\+?%s:[ \t]*\"?\\([^\"\n]*\\)\"?" key) (cdr bounds) t)
+      (let ((v (string-trim (match-string 1))))
+        (unless (string-empty-p v) v)))))
+
+(defun denote-mcp--org-get (key)
+  "Return the value of #+KEY: in the current buffer, or nil."
+  (save-excursion
+    (goto-char (point-min))
+    (when (re-search-forward (format "^#\\+%s:[ \t]*\\(.*\\)$" key) nil t)
+      (let ((v (string-trim (match-string 1))))
+        (unless (string-empty-p v) v)))))
+
+(defun denote-mcp--frontmatter-in-sync-p (note)
+  "Return non-nil if the front matter in the current buffer matches NOTE's name.
+The buffer holds the head of NOTE's file."
+  (let ((want-id (denote-mcp--note-id note))
+        (want-sig (denote-mcp--note-seq note)))
+    (goto-char (point-min))
+    (pcase (denote-mcp--note-ext note)
+      ("org" (and (equal (denote-mcp--org-get "identifier") want-id)
+                  (equal (denote-mcp--org-get "signature") want-sig)))
+      ;; Markdown notes carry either fenced YAML or bare #+key: lines.
+      ("md" (if-let* ((b (denote-mcp--md-frontmatter-bounds)))
+                (progn
+                  (goto-char (car b))
+                  (and (not (re-search-forward "^#\\+[a-zA-Z]+:" (cdr b) t))
+                       (equal (denote-mcp--md-get "identifier" b) want-id)
+                       (equal (denote-mcp--md-get "signature" b) want-sig)))
+              (and (equal (denote-mcp--org-get "identifier") want-id)
+                   (equal (denote-mcp--org-get "signature") want-sig))))
+      (_ t))))
+
+(defun denote-mcp--sync-org-buffer (base want-id want-sig)
+  "Fix identifier and signature in the current Org buffer, return change strings.
+BASE is the file name for messages; WANT-ID and WANT-SIG come from it."
+  (let (changes)
+    (goto-char (point-min))
+    (if (re-search-forward "^#\\+identifier:[ \t]*\\(.*\\)$" nil t)
+        (let ((cur (string-trim (match-string 1))))
+          (unless (equal cur want-id)
+            (replace-match (concat "#+identifier: " want-id))
+            (push (format "%s: identifier %s -> %s" base cur want-id) changes)))
+      (goto-char (point-min))
+      (insert "#+identifier: " want-id "\n")
+      (push (format "%s: inserted identifier %s" base want-id) changes))
+    (goto-char (point-min))
+    (let ((has-sig (re-search-forward "^#\\+signature:[ \t]*\\(.*\\)$" nil t)))
+      (cond
+       (want-sig
+        (if has-sig
+            (let ((cur (string-trim (match-string 1))))
+              (unless (equal cur want-sig)
+                (replace-match (concat "#+signature:  " want-sig))
+                (push (format "%s: signature %s -> %s" base cur want-sig) changes)))
+          (goto-char (point-min))
+          (if (re-search-forward "^#\\+identifier:.*$" nil t)
+              (progn (end-of-line) (insert "\n#+signature:  " want-sig))
+            (insert "#+signature:  " want-sig "\n"))
+          (push (format "%s: inserted signature %s" base want-sig) changes)))
+       ((and (not want-sig) has-sig)
+        (delete-region (line-beginning-position) (min (point-max) (1+ (line-end-position))))
+        (push (format "%s: removed obsolete signature" base) changes))))
+    changes))
+
+(defun denote-mcp--md-set (key value bounds)
+  "Set KEY to VALUE inside BOUNDS of the current Markdown buffer."
+  (save-excursion
+    (goto-char (car bounds))
+    (if (re-search-forward (format "^#?\\+?%s:[ \t]*.*$" key) (cdr bounds) t)
+        (progn (delete-region (line-beginning-position) (line-end-position))
+               (insert (format "%s: \"%s\"" key value)))
+      (goto-char (cdr bounds))
+      (insert (format "%s: \"%s\"\n" key value)))))
+
+(defun denote-mcp--sync-md-buffer (base want-id want-sig)
+  "Fix identifier and signature in the current Markdown YAML buffer.
+BASE, WANT-ID and WANT-SIG are as in `denote-mcp--sync-org-buffer'.
+Also converts `#+key: v' lines inside the front matter to `key: \"v\"'.
+Return change strings."
+  (let (changes)
+    (when-let* ((b (denote-mcp--md-frontmatter-bounds)))
+      (save-excursion
+        (goto-char (car b))
+        (let ((end (copy-marker (cdr b))))
+          (while (re-search-forward "^#\\+\\([a-zA-Z]+\\):[ \t]*\\(.*\\)$" end t)
+            (let ((k (downcase (match-string 1))) (v (string-trim (match-string 2))))
+              (delete-region (line-beginning-position) (line-end-position))
+              (insert (format "%s: \"%s\"" k v))
+              (unless changes
+                (push (format "%s: repaired mixed #+key: syntax in YAML front matter" base)
+                      changes))))
+          (set-marker end nil)))
+      (setq b (denote-mcp--md-frontmatter-bounds))
+      (let ((cur-id (denote-mcp--md-get "identifier" b))
+            (cur-sig (denote-mcp--md-get "signature" b)))
+        (unless (equal cur-id want-id)
+          (denote-mcp--md-set "identifier" want-id b)
+          (push (format "%s: identifier %s -> %s" base (or cur-id "nil") want-id) changes))
+        (setq b (denote-mcp--md-frontmatter-bounds))
+        (cond
+         (want-sig
+          (unless (equal cur-sig want-sig)
+            (denote-mcp--md-set "signature" want-sig b)
+            (push (format "%s: signature %s -> %s" base (or cur-sig "nil") want-sig) changes)))
+         (cur-sig
+          (save-excursion
+            (goto-char (car b))
+            (when (re-search-forward "^#?\\+?signature:.*\n?" (cdr b) t)
+              (delete-region (match-beginning 0) (match-end 0))))
+          (push (format "%s: removed obsolete signature" base) changes)))))
+    changes))
+
+(defun denote-mcp--sync-note (note scratch)
+  "Make NOTE's front matter match its file name; return change strings.
+SCRATCH is a reusable buffer; notes whose first 4 KiB already match are
+skipped without being visited."
+  (let* ((f (denote-mcp--note-path note))
+         (ext (denote-mcp--note-ext note))
+         (base (file-name-nondirectory f)))
+    (when (and (member ext '("org" "md"))
+               (denote-mcp--note-id note)
+               (not (with-current-buffer scratch
+                      (erase-buffer)
+                      (denote-mcp--insert-head f 4096)
+                      (denote-mcp--frontmatter-in-sync-p note))))
+      (let ((want-id (denote-mcp--note-id note))
+            (want-sig (denote-mcp--note-seq note))
+            changes)
+        (denote-mcp--with-visited f
+          (setq changes (if (and (equal ext "md") (denote-mcp--md-frontmatter-bounds))
+                            (denote-mcp--sync-md-buffer base want-id want-sig)
+                          (denote-mcp--sync-org-buffer base want-id want-sig)))
+          (when changes
+            (when (derived-mode-p 'org-mode)
+              (ignore-errors (org-element-cache-reset)))
+            (save-buffer)))
+        (nreverse changes)))))
+
 (defun denote-mcp--sync-frontmatter (&optional file)
-  "Sync #+identifier: and #+signature: frontmatter to match filenames.
-If FILE is given, sync only FILE; otherwise sync all notes in denote directory.
-Returns a list of change descriptions."
-  (let* ((files (if file
-                    (list (denote-mcp--find-file file))
-                  (denote-mcp--all-note-files)))
-         (changes nil))
-    (denote-mcp-silently
-     (dolist (f files)
-       (when (and f (file-exists-p f))
-         (let* ((base (file-name-nondirectory f))
-                (parsed (denote-mcp--parse-filename f))
-                (want-id (plist-get parsed :id))
-                (want-sig (plist-get parsed :seq)))
-           (when want-id
-             (with-current-buffer (find-file-noselect f)
-               (let ((file-changed nil))
-                 ;; Check identifier
-                 (goto-char (point-min))
-                 (if (re-search-forward "^#\\+identifier:[ \t]*\\(.*\\)$" nil t)
-                     (let ((cur-id (string-trim (match-string 1))))
-                       (unless (equal cur-id want-id)
-                         (replace-match (concat "#+identifier: " want-id))
-                         (push (format "%s: identifier %s -> %s" base cur-id want-id) changes)
-                         (setq file-changed t)))
-                   ;; Missing identifier
-                   (goto-char (point-min))
-                   (insert "#+identifier: " want-id "\n")
-                   (push (format "%s: inserted identifier %s" base want-id) changes)
-                   (setq file-changed t))
-
-                 ;; Check signature
-                 (goto-char (point-min))
-                 (let ((has-sig (re-search-forward "^#\\+signature:[ \t]*\\(.*\\)$" nil t)))
-                   (cond
-                    (want-sig
-                     (if has-sig
-                         (let ((cur-sig (string-trim (match-string 1))))
-                           (unless (equal cur-sig want-sig)
-                             (replace-match (concat "#+signature:  " want-sig))
-                             (push (format "%s: signature %s -> %s" base cur-sig want-sig) changes)
-                             (setq file-changed t)))
-                       (goto-char (point-min))
-                       (if (re-search-forward "^#\\+identifier:.*$" nil t)
-                           (progn (end-of-line) (insert "\n#+signature:  " want-sig))
-                         (insert "#+signature:  " want-sig "\n"))
-                       (push (format "%s: inserted signature %s" base want-sig) changes)
-                       (setq file-changed t)))
-                    ((and (not want-sig) has-sig)
-                     (delete-region (line-beginning-position) (min (point-max) (1+ (line-end-position))))
-                     (push (format "%s: removed obsolete signature" base) changes)
-                     (setq file-changed t))))
-
-                 (when file-changed
-                   (when (derived-mode-p 'org-mode)
-                     (ignore-errors (org-element-cache-reset)))
-                   (save-buffer)))))))))
-    (nreverse changes)))
+  "Sync identifier and signature front matter to match file names.
+If FILE is given, sync only FILE; otherwise sync every Org and Markdown note.
+Return a list of change descriptions."
+  (let ((notes (if file
+                   (when-let* ((path (denote-mcp--find-file file))
+                               (n (denote-mcp--note-from-path path)))
+                     (list n))
+                 (denote-mcp--notes)))
+        changes)
+    (with-temp-buffer
+      (let ((scratch (current-buffer)))
+        (denote-mcp-silently
+         (dolist (n notes)
+           (setq changes (nconc changes (denote-mcp--sync-note n scratch)))))))
+    ;; Only contents change here, never names, so the note index stays valid.
+    changes))
 
 ;;; Service Definition & Top-Level Tool Registration
 
@@ -298,29 +595,46 @@ Returns a list of change descriptions."
         :description "Denote Note-Taking and Knowledge Base Management"))
   "The Denote `mcpkit-service' instance.")
 
-;; 1. denote_find
+;; 1. denote_find (also backs denote_find_by_slug and denote_find_most_recent)
+(cl-defun denote-mcp--find-notes (&key query tags sequence prefix sort limit)
+  "Return up to LIMIT notes matching all given criteria.
+QUERY is a regexp on the relative file name, TAGS a list that must all be
+present, SEQUENCE an exact signature, PREFIX a signature prefix.  SORT is
+`recent' for newest identifier first."
+  (let* ((notes (denote-mcp--notes query))
+         (hits (seq-filter
+                (lambda (n)
+                  (let ((seq (denote-mcp--note-seq n)))
+                    (and (or (null sequence) (equal seq sequence))
+                         (or (null prefix) (and seq (string-prefix-p prefix seq)))
+                         (or (null tags)
+                             (let ((kw (denote-mcp--note-keywords n)))
+                               (seq-every-p (lambda (tg) (member tg kw)) tags))))))
+                notes)))
+    (when (eq sort 'recent)
+      (setq hits (sort (copy-sequence hits)
+                       (lambda (a b) (string> (file-name-nondirectory (denote-mcp--note-path a))
+                                              (file-name-nondirectory (denote-mcp--note-path b)))))))
+    (if limit (seq-take hits limit) hits)))
+
 (mcpkit-register-tool 'denote_find 'denote
-  :description "Find notes matching a regex across title, keywords, identifier, and sequence."
+  :description "Find notes by any combination of: regex over the file name (title, keywords, identifier, sequence), required tags, exact sequence, sequence prefix. Optionally newest first. Returns id, sequence, title, keywords, path."
   :input-schema '(:type "object"
-                  :properties (:query (:type "string" :description "Search regex")
+                  :properties (:query (:type "string" :description "Regex over the file name (optional)")
+                               :tags (:type "array" :items (:type "string") :description "Tags that must all be present")
+                               :sequence (:type "string" :description "Exact sequence signature")
+                               :sequence_prefix (:type "string" :description "Sequence prefix (subtree)")
+                               :sort (:type "string" :enum ["name" "recent"] :description "recent = newest identifier first")
                                :max_results (:type "integer" :description "Max results (default 50)"))
-                  :required ["query"])
-  (let* ((query (plist-get args :query))
-         (max-count (or (plist-get args :max_results) 50))
-         (files (denote-mcp--all-note-files query))
-         (results nil))
-    (dolist (f (seq-take files max-count))
-      (when (file-regular-p f)
-        (let ((parsed (denote-mcp--parse-filename f)))
-          (when (plist-get parsed :id)
-            (push (list :id (plist-get parsed :id)
-                        :sequence (plist-get parsed :seq)
-                        :title (or (denote-retrieve-title-value f (denote-filetype-heuristics f))
-                                   (plist-get parsed :title))
-                        :keywords (or (denote-retrieve-filename-keywords-as-list f) [])
-                        :path f)
-                  results)))))
-    (nreverse results)))
+                  :required [])
+  (mapcar #'denote-mcp--summary
+          (denote-mcp--find-notes
+           :query (plist-get args :query)
+           :tags (seq-into (plist-get args :tags) 'list)
+           :sequence (plist-get args :sequence)
+           :prefix (plist-get args :sequence_prefix)
+           :sort (and (equal (plist-get args :sort) "recent") 'recent)
+           :limit (or (plist-get args :max_results) 50))))
 
 ;; 2. denote_find_by_slug
 (mcpkit-register-tool 'denote_find_by_slug 'denote
@@ -329,44 +643,22 @@ Returns a list of change descriptions."
                   :properties (:slug (:type "string" :description "Unique title slug or identifier fragment"))
                   :required ["slug"])
   (let* ((slug (plist-get args :slug))
-         (file (denote-mcp--find-file slug)))
-    (if (not file)
+         (file (denote-mcp--find-file slug))
+         (note (and file (denote-mcp--note-from-path file))))
+    (if (not note)
         (list :found :json-false :slug slug)
-      (let ((parsed (denote-mcp--parse-filename file)))
-        (list :found t
-              :path file
-              :id (plist-get parsed :id)
-              :sequence (plist-get parsed :seq)
-              :title (or (denote-retrieve-title-value file (denote-filetype-heuristics file))
-                         (plist-get parsed :title))
-              :keywords (or (denote-retrieve-filename-keywords-as-list file) []))))))
+      (append (list :found t) (denote-mcp--summary note)))))
 
 ;; 3. denote_find_most_recent
 (mcpkit-register-tool 'denote_find_most_recent 'denote
-  :description "Find the most recently authored note matching all specified tags (e.g. [\"agent\", \"plan\"])."
+  :description "Find the most recently authored note matching all specified tags (e.g. [\"agent\", \"plan\"]). Same as denote_find with sort=recent, max_results=1."
   :input-schema '(:type "object"
                   :properties (:tags (:type "array" :items (:type "string") :description "List of required tags")))
-  (let* ((tags (seq-into (plist-get args :tags) 'list))
-         (files (denote-mcp--all-note-files))
-         (matches
-          (cl-remove-if-not
-           (lambda (f)
-             (or (null tags)
-                 (let ((filetags (denote-retrieve-filename-keywords-as-list f)))
-                   (cl-every (lambda (tag) (member tag filetags)) tags))))
-           files))
-         (sorted (sort matches (lambda (a b) (string> (file-name-nondirectory a)
-                                                      (file-name-nondirectory b)))))
-         (best (car sorted)))
-    (if (not best)
-        (list :found :json-false)
-      (let ((parsed (denote-mcp--parse-filename best)))
-        (list :found t
-              :path best
-              :id (plist-get parsed :id)
-              :sequence (plist-get parsed :seq)
-              :title (denote-retrieve-title-value best (denote-filetype-heuristics best))
-              :keywords (or (denote-retrieve-filename-keywords-as-list best) []))))))
+  (if-let* ((note (car (denote-mcp--find-notes
+                        :tags (seq-into (plist-get args :tags) 'list)
+                        :sort 'recent :limit 1))))
+      (append (list :found t) (denote-mcp--summary note))
+    (list :found :json-false)))
 
 ;; 4. denote_get_metadata
 (mcpkit-register-tool 'denote_get_metadata 'denote
@@ -385,20 +677,25 @@ Returns a list of change descriptions."
   :description "Safely read the text content of a denote note with UTF-8 encoding."
   :input-schema '(:type "object"
                   :properties (:file_or_slug (:type "string" :description "File path or slug fragment")
-                               :max_bytes (:type "integer" :description "Optional max bytes to read"))
+                               :max_bytes (:type "integer" :description "Optional max bytes to read")
+                               :include_metadata (:type "boolean" :description "Also return the get_metadata result (saves a round trip)"))
                   :required ["file_or_slug"])
   (let* ((target (plist-get args :file_or_slug))
          (file (denote-mcp--find-file target))
          (max-b (plist-get args :max_bytes)))
     (unless file
       (error "Note not found for: %s" target))
-    (denote-mcp-silently
-     (with-temp-buffer
-       (insert-file-contents file nil 0 max-b)
-       (list :path file
-             :content (buffer-string)
-             :truncated (if (and max-b (> (file-attribute-size (file-attributes file)) max-b))
-                            t :json-false))))))
+    (let ((result
+           (denote-mcp-silently
+            (with-temp-buffer
+              (insert-file-contents file nil 0 max-b)
+              (list :path file
+                    :content (buffer-string)
+                    :truncated (if (and max-b (> (file-attribute-size (file-attributes file)) max-b))
+                                   t :json-false))))))
+      (if (eq t (plist-get args :include_metadata))
+          (append result (list :metadata (denote-mcp--get-metadata file)))
+        result))))
 
 ;; 6. denote_create_note
 (mcpkit-register-tool 'denote_create_note 'denote
@@ -419,9 +716,10 @@ Returns a list of change descriptions."
          (date-str (plist-get args :date))
          (date (when date-str (date-to-time (concat date-str " 00:00:00"))))
          (denote-dir (denote-mcp-get-directory)))
-    (denote-mcp-silently
+    (denote-mcp-mutating
      (let ((file (save-window-excursion
-                   (denote title keywords file-type denote-dir date))))
+                   (denote title keywords file-type denote-dir date nil
+                           (and seq (not (string-empty-p seq)) seq)))))
        (unless file (error "denote returned nil for %s" title))
        ;; Save initial content
        (with-current-buffer (find-file-noselect file)
@@ -430,9 +728,6 @@ Returns a list of change descriptions."
            (unless (bolp) (insert "\n"))
            (insert content))
          (basic-save-buffer))
-       ;; Apply sequence if requested
-       (when (and seq (not (string-empty-p seq)))
-         (setq file (denote-mcp--set-sequence file seq)))
        (let ((meta (denote-mcp--get-metadata file)))
          (list :path file
                :id (plist-get meta :id)
@@ -471,31 +766,80 @@ Returns a list of change descriptions."
          (basic-save-buffer)
          (list :path file :bytes_appended (length content)))))))
 
-;; 8. denote_rename
+;; 8. denote_rename (and its keyword-only alias denote_retag)
+(defun denote-mcp--list (value)
+  "Return VALUE (list, vector or nil) as a list."
+  (seq-into (or value nil) 'list))
+
+(cl-defun denote-mcp--update-note (file &key title set add remove)
+  "Change FILE's TITLE and/or keywords, return a result plist.
+SET replaces the keyword list first; ADD and REMOVE then adjust it.  Nothing
+is touched when the result equals the current state (:changed nil)."
+  (let* ((old (denote-retrieve-filename-keywords-as-list file))
+         (kws (denote-keywords-sort
+               (seq-remove (lambda (k) (member k remove))
+                           (seq-uniq (append (if set set old) add)))))
+         (keywords-changed (not (equal kws (denote-keywords-sort (copy-sequence old)))))
+         (old-title (and title (denote-mcp--title file)))
+         (title-changed (and title (not (equal title old-title)))))
+    (if (not (or keywords-changed title-changed))
+        (list :old_path file :new_path file :path file
+              :title (or old-title (denote-mcp--title file)) :keywords (or old []) :changed :json-false)
+      (denote-mcp-mutating
+       (let ((new-path (denote-rename-file file
+                                           (if title-changed title 'keep-current)
+                                           (if keywords-changed kws 'keep-current)
+                                           'keep-current 'keep-current 'keep-current)))
+         (list :old_path file :new_path new-path :path new-path
+               :title (denote-mcp--title new-path)
+               :keywords (or (denote-retrieve-filename-keywords-as-list new-path) [])
+               :changed t))))))
+
+(defun denote-mcp--update-note-args (args &optional keyword-only)
+  "Apply the rename/retag ARGS plist, honoring a `files' batch.
+With KEYWORD-ONLY, ARGS use `set' instead of `new_keywords' and no title."
+  (let* ((targets (or (denote-mcp--list (plist-get args :files))
+                      (list (plist-get args :file_or_slug))))
+         (run (lambda (target)
+                (let ((file (denote-mcp--find-file target)))
+                  (unless file (error "Note not found for: %s" target))
+                  (denote-mcp--update-note
+                   file
+                   :title (and (not keyword-only) (plist-get args :new_title))
+                   :set (denote-mcp--list (if keyword-only (plist-get args :set)
+                                            (plist-get args :new_keywords)))
+                   :add (denote-mcp--list (plist-get args :add_keywords))
+                   :remove (denote-mcp--list (plist-get args :remove_keywords)))))))
+    (if (plist-get args :files)
+        (list :results (vconcat (mapcar run targets)))
+      (funcall run (car targets)))))
+
 (mcpkit-register-tool 'denote_rename 'denote
-  :description "Update title and/or keywords of a note, updating frontmatter and renaming on disk."
+  :description "Update a note's title and/or keywords, rewriting frontmatter and renaming on disk. new_keywords replaces the list; add_keywords/remove_keywords adjust it incrementally. Idempotent (changed=false when nothing differs). Pass files[] to batch keyword edits."
   :input-schema '(:type "object"
                   :properties (:file_or_slug (:type "string" :description "File path or slug fragment")
+                               :files (:type "array" :items (:type "string") :description "Batch: several files or slugs instead of file_or_slug")
                                :new_title (:type "string" :description "New title string (or omit to keep)")
-                               :new_keywords (:type "array" :items (:type "string") :description "New keywords list"))
-                  :required ["file_or_slug"])
-  (let* ((target (plist-get args :file_or_slug))
-         (new-title (plist-get args :new_title))
-         (new-kws (seq-into (plist-get args :new_keywords) 'list))
-         (file (denote-mcp--find-file target)))
-    (unless file (error "Note not found for: %s" target))
-    (denote-mcp-silently
-     (let* ((denote-save-buffers t)
-            (new-path (denote-rename-file file
-                                         (or new-title 'keep-current)
-                                         (or new-kws 'keep-current)
-                                         'keep-current
-                                         'keep-current
-                                         'keep-current)))
-       (list :old_path file
-             :new_path new-path
-             :title (or new-title (denote-retrieve-title-value new-path (denote-filetype-heuristics new-path)))
-             :keywords (or (denote-retrieve-filename-keywords-as-list new-path) []))))))
+                               :new_keywords (:type "array" :items (:type "string") :description "Replace the keywords list")
+                               :add_keywords (:type "array" :items (:type "string") :description "Keywords to add")
+                               :remove_keywords (:type "array" :items (:type "string") :description "Keywords to remove"))
+                  :required [])
+  (denote-mcp--update-note-args args))
+
+(mcpkit-register-tool 'denote_retag 'denote
+  :description "Add, remove or replace keywords (filetags) of one note or a batch (files[]); updates frontmatter and filename. Idempotent. Keyword-only form of denote_rename."
+  :input-schema '(:type "object"
+                  :properties (:file_or_slug (:type "string" :description "File path or slug fragment")
+                               :files (:type "array" :items (:type "string") :description "Batch: several files or slugs")
+                               :add (:type "array" :items (:type "string") :description "Keywords to add")
+                               :remove (:type "array" :items (:type "string") :description "Keywords to remove")
+                               :set (:type "array" :items (:type "string") :description "Replace the keyword list first"))
+                  :required [])
+  (denote-mcp--update-note-args
+   (list :file_or_slug (plist-get args :file_or_slug) :files (plist-get args :files)
+         :set (plist-get args :set)
+         :add_keywords (plist-get args :add) :remove_keywords (plist-get args :remove))
+   t))
 
 ;; Convert Markdown notes to Org, including their body.
 (mcpkit-register-tool 'denote_convert_to_org 'denote
@@ -582,33 +926,41 @@ Returns a list of change descriptions."
            (delete-directory temp-dir t)))))))
 
 ;; 9. denote_mark_executed
+(defun denote-mcp--mark-executed (file)
+  "Mark FILE executed: add the executed keyword, drop `done', set status."
+  (let* ((kw denote-mcp-executed-keyword)
+         (raw (denote-retrieve-filename-keywords-as-list file)))
+    (if (and (member kw raw) (not (member "done" raw)))
+        (list :path file :status "already_marked")
+      (let* ((clean (seq-remove (lambda (k) (member k '("done" "x"))) raw))
+             (new-kws (cons kw clean)))
+        (denote-mcp-mutating
+         (denote-mcp--with-visited file
+           (goto-char (point-min))
+           (when (re-search-forward "^#\\+filetags:.*" nil t)
+             (replace-match (format "#+filetags:   :%s:" (mapconcat #'identity new-kws ":"))))
+           (goto-char (point-min))
+           (when (re-search-forward "^#\\+execution_status:[ \t]*.*$" nil t)
+             (replace-match "#+execution_status: complete"))
+           (when (derived-mode-p 'org-mode)
+             (ignore-errors (org-element-cache-reset)))
+           (save-buffer))
+         (let ((new-path (denote-rename-file file 'keep-current new-kws 'keep-current 'keep-current 'keep-current)))
+           (list :path new-path :status "marked" :keywords new-kws)))))))
+
 (mcpkit-register-tool 'denote_mark_executed 'denote
-  :description "Mark a plan note as executed: applies 'x' filetag, cleans 'done', and updates execution status."
+  :description "Mark plan notes as executed: applies 'x' filetag, cleans 'done', and updates execution status. Pass files[] to mark several in one call."
   :input-schema '(:type "object"
-                  :properties (:file_or_slug (:type "string" :description "File path or slug fragment"))
-                  :required ["file_or_slug"])
-  (let* ((target (plist-get args :file_or_slug))
-         (file (denote-mcp--find-file target)))
-    (unless file (error "Note not found for: %s" target))
-    (denote-mcp-silently
-     (let* ((kw denote-mcp-executed-keyword)
-            (raw (denote-retrieve-filename-keywords-as-list file)))
-       (if (and (member kw raw) (not (member "done" raw)))
-           (list :path file :status "already_marked")
-         (let* ((clean (seq-remove (lambda (k) (member k '("done" "x"))) raw))
-                (new-kws (cons kw clean)))
-           (with-current-buffer (find-file-noselect file)
-             (goto-char (point-min))
-             (when (re-search-forward "^#\\+filetags:.*" nil t)
-               (replace-match (format "#+filetags:   :%s:" (mapconcat #'identity new-kws ":"))))
-             (goto-char (point-min))
-             (when (re-search-forward "^#\\+execution_status:[ \t]*.*$" nil t)
-               (replace-match "#+execution_status: complete"))
-             (when (derived-mode-p 'org-mode)
-               (ignore-errors (org-element-cache-reset)))
-             (save-buffer))
-           (let ((new-path (denote-rename-file file 'keep-current new-kws 'keep-current 'keep-current 'keep-current)))
-             (list :path new-path :status "marked" :keywords new-kws))))))))
+                  :properties (:file_or_slug (:type "string" :description "File path or slug fragment")
+                               :files (:type "array" :items (:type "string") :description "Batch: several files or slugs"))
+                  :required [])
+  (let ((run (lambda (target)
+               (let ((file (denote-mcp--find-file target)))
+                 (unless file (error "Note not found for: %s" target))
+                 (denote-mcp--mark-executed file)))))
+    (if (plist-get args :files)
+        (list :results (vconcat (mapcar run (denote-mcp--list (plist-get args :files)))))
+      (funcall run (plist-get args :file_or_slug)))))
 
 ;; 10. denote_sync_frontmatter
 (mcpkit-register-tool 'denote_sync_frontmatter 'denote
@@ -632,29 +984,30 @@ Returns a list of change descriptions."
          (seq (or (plist-get args :target_sequence)
                   (when (and target (not (string-empty-p target)))
                     (when-let* ((file (denote-mcp--find-file target)))
-                      (plist-get (denote-mcp--parse-filename file) :seq)))))
+                      (denote-mcp--note-seq (denote-mcp--note-from-path file))))))
          (type-str (plist-get args :type))
-         (rel-type (when type-str (intern type-str))))
-    (if (and seq (not (string-empty-p seq)))
-        (let* ((has-children
-                (cl-some (lambda (s) (and (not (string= s seq)) (string-prefix-p seq s)))
-                         (denote-sequence-get-all-sequences-with-prefix seq)))
-               (next-seq (cond
-                          ((eq rel-type 'child) (denote-sequence-get-new 'child seq))
-                          ((eq rel-type 'sibling) (denote-sequence-get-new 'sibling seq))
-                          (has-children (denote-sequence-get-new 'child seq))
-                          ((< (denote-sequence-depth seq) 3)
-                           (denote-sequence-get-new 'child seq))
-                          (t (denote-sequence-get-new 'sibling seq))))
-               (rel (if (string-prefix-p seq next-seq) "child" "sibling")))
-          (list :target_sequence seq
-                :next_sequence next-seq
-                :relation rel))
-      (if (memq rel-type '(child sibling))
-          (error "Cannot calculate %s sequence without a target_sequence or file_or_slug" rel-type)
-        (let ((next-seq (denote-sequence-get-new 'parent)))
+         (rel-type (when type-str (intern type-str)))
+         (all (denote-mcp--sequences)))
+    (denote-mcp--with-scheme
+      (if (and seq (not (string-empty-p seq)))
+          (let* ((has-children
+                  (cl-some (lambda (s) (and (not (string= s seq)) (string-prefix-p seq s)))
+                           (denote-sequence-get-all-sequences-with-prefix seq all)))
+                 (next-seq (cond
+                            ((eq rel-type 'child) (denote-sequence-get-new 'child seq all))
+                            ((eq rel-type 'sibling) (denote-sequence-get-new 'sibling seq all))
+                            (has-children (denote-sequence-get-new 'child seq all))
+                            ((< (denote-sequence-depth seq) 3)
+                             (denote-sequence-get-new 'child seq all))
+                            (t (denote-sequence-get-new 'sibling seq all))))
+                 (rel (if (string-prefix-p seq next-seq) "child" "sibling")))
+            (list :target_sequence seq
+                  :next_sequence next-seq
+                  :relation rel))
+        (if (memq rel-type '(child sibling))
+            (error "Cannot calculate %s sequence without a target_sequence or file_or_slug" rel-type)
           (list :target_sequence ""
-                :next_sequence next-seq
+                :next_sequence (denote-sequence-get-new 'parent nil all)
                 :relation "parent"))))))
 
 ;; 12. denote_seq_set
@@ -718,8 +1071,8 @@ Returns a list of change descriptions."
          (parent-file (denote-mcp--find-file parent)))
     (unless src-file (error "Source note not found: %s" src))
     (unless parent-file (error "Parent note not found: %s" parent))
-    (denote-mcp-silently
-     (let ((denote-sequence-scheme 'alphanumeric))
+    (denote-mcp-mutating
+     (let ((denote-sequence-scheme (or denote-mcp-sequence-scheme 'alphanumeric)))
        (denote-sequence-reparent src-file parent-file recursive)
        (let* ((parent-seq (plist-get (denote-mcp--parse-filename parent-file) :seq))
               (src-id (plist-get (denote-mcp--parse-filename src-file) :id))
@@ -731,47 +1084,55 @@ Returns a list of change descriptions."
 
 ;; 15. denote_seq_tree
 (mcpkit-register-tool 'denote_seq_tree 'denote
-  :description "List all notes organized in Folgezettel sequence hierarchy."
+  :description "List all notes organized in Folgezettel sequence hierarchy. Set titles=false to skip reading titles from the files (faster)."
   :input-schema '(:type "object"
-                  :properties (:root_sequence (:type "string" :description "Optional root sequence prefix")))
+                  :properties (:root_sequence (:type "string" :description "Optional root sequence prefix")
+                               :titles (:type "boolean" :description "Read titles from the files (default true)"))
+                  :required [])
   (let* ((root (plist-get args :root_sequence))
-         (files (denote-mcp--all-note-files "==.*\\.\\(org\\|md\\)\\'"))
-         (notes nil))
-    (dolist (f files)
-      (let ((parsed (denote-mcp--parse-filename f)))
-        (when-let* ((seq (plist-get parsed :seq)))
-          (when (or (null root) (string-prefix-p root seq))
-            (push (list :sequence seq
-                        :id (plist-get parsed :id)
-                        :title (or (denote-retrieve-title-value f (denote-filetype-heuristics f))
-                                   (plist-get parsed :title))
-                        :path f)
-                  notes)))))
-    (let ((sorted (sort notes (lambda (a b) (string< (plist-get a :sequence)
-                                                     (plist-get b :sequence))))))
-      (list :count (length sorted) :notes (vconcat sorted)))))
+         (titles (not (eq :json-false (plist-get args :titles))))
+         (notes (seq-filter
+                 (lambda (n)
+                   (and (member (denote-mcp--note-ext n) '("org" "md"))
+                        (when-let* ((seq (denote-mcp--note-seq n)))
+                          (or (null root) (string-prefix-p root seq)))))
+                 (denote-mcp--notes)))
+         (sorted (sort (copy-sequence notes)
+                       (lambda (a b) (string< (denote-mcp--note-seq a) (denote-mcp--note-seq b)))))
+         (rows (mapcar
+                (lambda (n)
+                  (list :sequence (denote-mcp--note-seq n)
+                        :id (denote-mcp--note-id n)
+                        :title (if titles
+                                   (denote-mcp--title (denote-mcp--note-path n) (denote-mcp--note-slug n))
+                                 (denote-mcp--note-slug n))
+                        :path (denote-mcp--note-path n)))
+                sorted)))
+    (list :count (length rows) :notes (vconcat rows))))
 
 ;; 16. denote_verify
 (mcpkit-register-tool 'denote_verify 'denote
-  :description "Validate sequence integrity, check for missing parent stubs, and report all sequences."
+  :description "Validate sequence integrity, check for missing parent stubs, and report all sequences. Also repairs frontmatter that disagrees with file names unless fix_frontmatter is false."
   :input-schema '(:type "object"
-                  :properties (:quiet (:type "boolean" :description "If true, skip full sequence list")))
-  (let* ((changes (denote-mcp--sync-frontmatter))
-         (files (denote-mcp--all-note-files))
-         (seqs (sort (cl-loop for f in files
-                              when (string-match "==\\([^-]+\\)--" (file-name-nondirectory f))
-                              collect (match-string 1 (file-name-nondirectory f)))
-                     #'string<))
+                  :properties (:quiet (:type "boolean" :description "If true, skip full sequence list")
+                               :fix_frontmatter (:type "boolean" :description "Sync frontmatter to file names (default true)"))
+                  :required [])
+  (let* ((changes (unless (eq :json-false (plist-get args :fix_frontmatter))
+                    (denote-mcp--sync-frontmatter)))
+         (seqs (sort (denote-mcp--sequences) #'string<))
+         (known (let ((h (make-hash-table :test #'equal)))
+                  (dolist (s seqs h) (puthash s t h))))
          (missing nil))
     ;; Check for implied parent gaps
-    (dolist (s seqs)
-      (when (> (length s) 1)
-        (let ((parent-seq (substring s 0 (1- (length s)))))
-          (unless (member parent-seq seqs)
-            (push (format "Missing parent sequence: %s (implied by %s)" parent-seq s) missing)))))
+    (denote-mcp--with-scheme
+      (dolist (s seqs)
+        (when (> (length s) 1)
+          (let ((parent-seq (denote-mcp--parent-sequence s)))
+            (when (and parent-seq (not (gethash parent-seq known)))
+              (push (format "Missing parent sequence: %s (implied by %s)" parent-seq s) missing))))))
     (list :valid (if missing :json-false t)
           :sequenced_count (length seqs)
-          :missing_parents (vconcat (nreverse missing))
+          :missing_parents (vconcat (nreverse (delete-dups missing)))
           :frontmatter_changes (vconcat changes)
           :sequences (if (plist-get args :quiet) [] (vconcat seqs)))))
 
@@ -826,10 +1187,11 @@ Returns a list of change descriptions."
 
 ;; 19. denote_redate
 (mcpkit-register-tool 'denote_redate 'denote
-  :description "Backdate note identifier and rewrite all links repo-wide in one call."
+  :description "Backdate a note's identifier and rewrite links to it in one call. scope=notes (default) rewrites inside the denote directory; scope=repo also rewrites every git-tracked file in the enclosing repository."
   :input-schema '(:type "object"
                   :properties (:file_or_slug (:type "string" :description "Target note slug or file")
-                               :new_identifier (:type "string" :description "New identifier YYYYMMDDTHHMMSS"))
+                               :new_identifier (:type "string" :description "New identifier YYYYMMDDTHHMMSS")
+                               :scope (:type "string" :enum ["notes" "repo"] :description "Where to rewrite links (default notes)"))
                   :required ["file_or_slug" "new_identifier"])
   (let* ((target (plist-get args :file_or_slug))
          (new-id (plist-get args :new_identifier))
@@ -840,11 +1202,146 @@ Returns a list of change descriptions."
            (new-path (denote-mcp--set-identifier file new-id))
            (links-fixed 0))
       (when (and new-path old-id (not (string= old-id new-id)))
-        (setq links-fixed (denote-mcp--replace-links old-id new-id)))
+        (setq links-fixed
+              (denote-mcp--replace-links
+               old-id new-id
+               (if (equal (plist-get args :scope) "repo")
+                   (delete-dups
+                    (append (denote-mcp--all-note-files)
+                            (denote-mcp--git-grep-files old-id (denote-mcp-get-directory))))
+                 nil))))
       (list :new_path new-path
             :old_identifier old-id
             :new_identifier new-id
             :links_updated links-fixed))))
+
+;; 20. denote_suggest_parent
+(defconst denote-mcp--category-body-threshold 600
+  "Body size in characters under which a note with children counts as a category.")
+
+(defun denote-mcp--body-size (file)
+  "Return the size of FILE past its leading #+ front matter block."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (goto-char (point-min))
+    (while (looking-at "^#\\+") (forward-line 1))
+    (- (point-max) (point))))
+
+(defun denote-mcp-suggest-parent (tags &optional top-n)
+  "Rank sequence nodes as candidate parents for a new note tagged TAGS.
+Score is overlap with the node's own tags plus half the overlap with the tags
+of all its descendants; ties go to the node with more descendants.  Return up
+to TOP-N (default 5) plists.
+
+The index is built from file names only.  Descendants are found in one pass
+over the sorted sequences (a node's subtree is the contiguous run after it),
+and files are read only for the winners."
+  (let* ((tagset (mapcar #'downcase tags))
+         (nodes (seq-filter (lambda (n) (and (denote-mcp--note-seq n)
+                                             (equal (denote-mcp--note-ext n) "org")))
+                            (denote-mcp--notes)))
+         (vec (vconcat (sort (copy-sequence nodes)
+                             (lambda (a b) (string< (denote-mcp--note-seq a)
+                                                    (denote-mcp--note-seq b))))))
+         (n (length vec))
+         (scored nil))
+    (dotimes (i n)
+      (let* ((node (aref vec i))
+             (seq (denote-mcp--note-seq node))
+             (j (1+ i))
+             (child-tags nil)
+             (count 0)
+             (sample nil))
+        (while (and (< j n) (string-prefix-p seq (denote-mcp--note-seq (aref vec j))))
+          (let ((child (aref vec j)))
+            (unless (equal (denote-mcp--note-seq child) seq)
+              (cl-incf count)
+              (when (< (length sample) 3) (push child sample))
+              (dolist (k (denote-mcp--note-keywords child)) (cl-pushnew k child-tags :test #'equal))))
+          (cl-incf j))
+        (let ((overlap (+ (length (cl-intersection tagset (denote-mcp--note-keywords node) :test #'equal))
+                          (* 0.5 (length (cl-intersection tagset child-tags :test #'equal))))))
+          (when (> overlap 0)
+            (push (list :node node :overlap overlap :count count :sample (nreverse sample)) scored)))))
+    (let ((top (seq-take
+                (sort scored
+                      (lambda (a b)
+                        (or (> (plist-get a :overlap) (plist-get b :overlap))
+                            (and (= (plist-get a :overlap) (plist-get b :overlap))
+                                 (> (plist-get a :count) (plist-get b :count))))))
+                (or top-n 5)))
+          (all (denote-mcp--sequences)))
+      (denote-mcp--with-scheme
+        (mapcar
+         (lambda (r)
+           (let* ((node (plist-get r :node))
+                  (file (denote-mcp--note-path node)))
+             (list :sequence (denote-mcp--note-seq node)
+                   :title (denote-mcp--title file (denote-mcp--note-slug node))
+                   :path file
+                   :overlap (plist-get r :overlap)
+                   :category (if (and (> (plist-get r :count) 0)
+                                      (< (denote-mcp--body-size file) denote-mcp--category-body-threshold))
+                                 t :json-false)
+                   :child_count (plist-get r :count)
+                   :sample_children (vconcat (mapcar (lambda (c) (denote-mcp--title (denote-mcp--note-path c) (denote-mcp--note-slug c)))
+                                                     (plist-get r :sample)))
+                   :next_sequence (denote-sequence-get-new 'child (denote-mcp--note-seq node) all))))
+         top)))))
+
+(mcpkit-register-tool 'denote_suggest_parent 'denote
+  :description "Rank existing sequence nodes as candidate parents for a new note by tag overlap (own tags plus half-weighted descendant tags). Each result has next_sequence ready for denote_seq_set or denote_create_note."
+  :input-schema '(:type "object"
+                  :properties (:tags (:type "array" :items (:type "string") :description "Tags of the new note")
+                               :top_n (:type "integer" :description "Max candidates (default 5)"))
+                  :required ["tags"])
+  (denote-mcp-suggest-parent (denote-mcp--list (plist-get args :tags)) (plist-get args :top_n)))
+
+;; 21. denote_find_authorship
+(defun denote-mcp-find-authorship (phrase &optional pathspecs show)
+  "Return the earliest commit, across all refs, that introduced PHRASE.
+PATHSPECS limit the search; SHOW adds the matching diff lines.  The search
+runs in the git repository containing the denote directory."
+  (let* ((dir (denote-mcp-get-directory))
+         (default-directory (or (locate-dominating-file dir ".git") dir))
+         (specs (or pathspecs '("."))))
+    (unless (executable-find "git") (error "Git is not available"))
+    (let ((commit
+           (with-temp-buffer
+             (apply #'process-file "git" nil '(t nil) nil
+                    "log" "--all" "--reverse" "-S" phrase "--format=%H" "--" specs)
+             (goto-char (point-min))
+             (buffer-substring (point) (line-end-position)))))
+      (if (string-empty-p commit)
+          (list :found :json-false :phrase phrase)
+        (let ((info (with-temp-buffer
+                      (process-file "git" nil t nil "log" "-1" "--date=iso-strict"
+                                    "--format=%ad%x00%s" commit)
+                      (split-string (string-trim-right (buffer-string)) "\0"))))
+          (append
+           (list :found t :commit commit :date (car info) :subject (cadr info))
+           (when show
+             (list :excerpt
+                   (with-temp-buffer
+                     (apply #'process-file "git" nil t nil "show" commit "--" specs)
+                     (let (lines)
+                       (goto-char (point-min))
+                       (while (not (eobp))
+                         (let ((line (buffer-substring (point) (line-end-position))))
+                           (when (string-search phrase line) (push line lines)))
+                         (forward-line 1))
+                       (mapconcat #'identity (seq-take (nreverse lines) 20) "\n")))))))))))
+
+(mcpkit-register-tool 'denote_find_authorship 'denote
+  :description "Find the earliest commit (all refs, all files) that introduced a phrase, to recover a note's real authorship date after migrations stamped it with the migration date. Verify with show=true: reused prose can give false matches."
+  :input-schema '(:type "object"
+                  :properties (:phrase (:type "string" :description "Unique phrase from the text (fixed string)")
+                               :pathspecs (:type "array" :items (:type "string") :description "Optional git pathspecs")
+                               :show (:type "boolean" :description "Include the matching diff lines"))
+                  :required ["phrase"])
+  (denote-mcp-find-authorship (plist-get args :phrase)
+                              (denote-mcp--list (plist-get args :pathspecs))
+                              (eq t (plist-get args :show))))
 
 ;;;###autoload
 (defun denote-mcp-register ()

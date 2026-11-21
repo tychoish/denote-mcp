@@ -21,11 +21,21 @@
        (when (file-directory-p temp-dir)
          (delete-directory temp-dir t)))))
 
+;; Helpers for the tests below.
+(defun test-denote-mcp--call (name &rest args)
+  "Call the denote tool NAME with ARGS and return its result."
+  (funcall (mcpkit-tool-handler (gethash name (mcpkit-service-tools denote-mcp-service)))
+           args (lambda (_status r) r)))
+
+(defun test-denote-mcp--note (title &rest args)
+  "Create a note TITLE with ARGS (plist for denote_create_note), return its path."
+  (plist-get (apply #'test-denote-mcp--call "denote_create_note" :title title args) :path))
+
 (ert-deftest test-denote-mcp/top-level-definition ()
   "Test that `denote-mcp-service' is defined and has tools at load time."
   (should (mcpkit-service-p denote-mcp-service))
   (should (eq (mcpkit-service-name denote-mcp-service) 'denote))
-  (should (>= (hash-table-count (mcpkit-service-tools denote-mcp-service)) 19)))
+  (should (>= (hash-table-count (mcpkit-service-tools denote-mcp-service)) 22)))
 
 (ert-deftest test-denote-mcp/registration ()
   "Test that all denote tools are registered on the denote service."
@@ -53,7 +63,10 @@
         (should (gethash "denote_verify" tools))
         (should (gethash "denote_link_string" tools))
         (should (gethash "denote_insert_dblock" tools))
-        (should (gethash "denote_redate" tools))))))
+        (should (gethash "denote_redate" tools))
+        (should (gethash "denote_retag" tools))
+        (should (gethash "denote_suggest_parent" tools))
+        (should (gethash "denote_find_authorship" tools))))))
 
 (ert-deftest test-denote-mcp/crud-workflow ()
   "Test creating a note, reading it, appending body, and reading metadata."
@@ -516,6 +529,181 @@
       (with-temp-buffer
         (insert-file-contents text-file)
         (should (equal (buffer-string) "Plain text\n"))))))
+
+(provide 'test-denote-mcp)
+
+;;; Retag, batching and the shared find tool
+
+(ert-deftest test-denote-mcp/retag-add-remove-set-idempotent ()
+  "`denote_retag' adds, removes and sets keywords, and is idempotent."
+  (test-mcpkit--with-temp-denote
+    (let* ((f (test-denote-mcp--note "Alpha" :keywords ["one" "two"]))
+           (r (test-denote-mcp--call "denote_retag" :file_or_slug f
+                                     :add ["three"] :remove ["one"])))
+      (should (eq t (plist-get r :changed)))
+      (should (equal (plist-get r :keywords) '("three" "two")))
+      (should (file-exists-p (plist-get r :path)))
+      (let ((again (test-denote-mcp--call "denote_retag" :file_or_slug (plist-get r :path)
+                                          :add ["three"])))
+        (should (eq :json-false (plist-get again :changed)))
+        (should (equal (plist-get again :path) (plist-get r :path))))
+      (let ((set (test-denote-mcp--call "denote_retag" :file_or_slug (plist-get r :path)
+                                        :set ["zed"])))
+        (should (equal (plist-get set :keywords) '("zed")))))))
+
+(ert-deftest test-denote-mcp/retag-batch-and-rename-incremental ()
+  "A files[] batch retags several notes; denote_rename accepts add_keywords."
+  (test-mcpkit--with-temp-denote
+    (let* ((a (test-denote-mcp--note "Batch A" :keywords ["k"]))
+           (b (test-denote-mcp--note "Batch B" :keywords ["k"]))
+           (res (test-denote-mcp--call "denote_retag" :files (vector a b) :add ["new"])))
+      (should (= 2 (length (plist-get res :results))))
+      (should (seq-every-p (lambda (r) (member "new" (plist-get r :keywords)))
+                           (plist-get res :results)))
+      (let ((r (test-denote-mcp--call "denote_rename" :file_or_slug "batch-a"
+                                      :add_keywords ["extra"] :new_title "Batch Alpha")))
+        (should (member "extra" (plist-get r :keywords)))
+        (should (equal "Batch Alpha" (plist-get r :title)))))))
+
+(ert-deftest test-denote-mcp/find-by-tags-sequence-and-recency ()
+  "`denote_find' filters by tags, sequence and prefix and can sort newest first."
+  (test-mcpkit--with-temp-denote
+    (let ((denote-sequence-scheme 'alphanumeric))
+      (test-denote-mcp--note "Old" :keywords ["agent" "plan"] :date "2026-01-01" :sequence "1")
+      (test-denote-mcp--note "New" :keywords ["agent" "plan"] :date "2026-02-01" :sequence "1a")
+      (test-denote-mcp--note "Other" :keywords ["misc"] :date "2026-03-01")
+      (let ((by-tags (test-denote-mcp--call "denote_find" :tags ["agent" "plan"] :sort "recent")))
+        (should (equal (mapcar (lambda (r) (plist-get r :title)) by-tags) '("New" "Old"))))
+      (should (equal (plist-get (car (test-denote-mcp--call "denote_find" :sequence "1")) :title) "Old"))
+      (should (= 2 (length (test-denote-mcp--call "denote_find" :sequence_prefix "1"))))
+      (should (= 1 (length (test-denote-mcp--call "denote_find" :tags ["misc"])))))))
+
+(ert-deftest test-denote-mcp/read-note-include-metadata ()
+  "`denote_read_note' can return metadata with the content."
+  (test-mcpkit--with-temp-denote
+    (test-denote-mcp--note "Readable" :keywords ["a"] :content "hello body")
+    (let ((r (test-denote-mcp--call "denote_read_note" :file_or_slug "readable"
+                                    :include_metadata t)))
+      (should (string-search "hello body" (plist-get r :content)))
+      (should (equal (plist-get (plist-get r :metadata) :title) "Readable")))))
+
+(ert-deftest test-denote-mcp/mark-executed-batch ()
+  "`denote_mark_executed' accepts files[]."
+  (test-mcpkit--with-temp-denote
+    (let* ((a (test-denote-mcp--note "Plan A" :keywords ["plan"]))
+           (b (test-denote-mcp--note "Plan B" :keywords ["plan" "done"]))
+           (res (test-denote-mcp--call "denote_mark_executed" :files (vector a b))))
+      (should (equal '("marked" "marked")
+                     (mapcar (lambda (r) (plist-get r :status)) (plist-get res :results)))))))
+
+;;; Index cache
+
+(ert-deftest test-denote-mcp/index-cache-follows-directory-changes ()
+  "The cached note index notices notes created outside the tools."
+  (test-mcpkit--with-temp-denote
+    (denote-mcp-invalidate-cache)
+    (should (= 0 (length (denote-mcp--notes))))
+    (with-temp-file (expand-file-name "20260101T000000--ext__tag.org" temp-dir)
+      (insert "#+title: Ext\n"))
+    (should (= 1 (length (denote-mcp--notes))))
+    (should (equal "20260101T000000" (denote-mcp--note-id (car (denote-mcp--notes)))))))
+
+;;; Front matter sync: Markdown YAML
+
+(ert-deftest test-denote-mcp/sync-frontmatter-markdown-yaml ()
+  "Markdown notes are fixed in YAML syntax, never given #+key: lines."
+  (test-mcpkit--with-temp-denote
+    (let ((md (expand-file-name "20260101T000000==1a--md-note__tag.md" temp-dir))
+          (ok (expand-file-name "20260102T000000==1b--md-ok__tag.md" temp-dir)))
+      (with-temp-file md
+        (insert "---\ntitle: \"MD\"\n#+identifier: 19990101T000000\n---\nBody\n"))
+      (with-temp-file ok
+        (insert "---\ntitle: \"OK\"\nidentifier: \"20260102T000000\"\nsignature: \"1b\"\n---\nBody\n"))
+      (let ((res (test-denote-mcp--call "denote_sync_frontmatter")))
+        (should (> (plist-get res :changes_count) 0))
+        (should (seq-every-p (lambda (c) (string-prefix-p "20260101T000000" c))
+                             (plist-get res :changes))))
+      (with-temp-buffer
+        (insert-file-contents md)
+        (should (string-match-p "^identifier: \"20260101T000000\"$" (buffer-string)))
+        (should (string-match-p "^signature: \"1a\"$" (buffer-string)))
+        (should-not (string-match-p "#\\+identifier" (buffer-string))))
+      ;; Second run: nothing to do, and the in-sync note was never touched.
+      (should (= 0 (plist-get (test-denote-mcp--call "denote_sync_frontmatter") :changes_count))))))
+
+(ert-deftest test-denote-mcp/sync-frontmatter-markdown-org-style ()
+  "Markdown notes with bare #+key: front matter are synced with org syntax."
+  (test-mcpkit--with-temp-denote
+    (let ((md (expand-file-name "20260101T000000==1a--bare__tag.md" temp-dir)))
+      (with-temp-file md (insert "#+title: Bare\n#+identifier: 19990101T000000\n\nBody\n"))
+      (let ((res (test-denote-mcp--call "denote_sync_frontmatter")))
+        (should (> (plist-get res :changes_count) 0)))
+      (with-temp-buffer
+        (insert-file-contents md)
+        (should (string-match-p "^#\\+identifier: 20260101T000000$" (buffer-string)))
+        (should (string-match-p "^#\\+signature: +1a$" (buffer-string))))
+      (should (= 0 (plist-get (test-denote-mcp--call "denote_sync_frontmatter") :changes_count))))))
+
+;;; Parent suggestion
+
+(ert-deftest test-denote-mcp/suggest-parent-ranks-and-proposes-next ()
+  "`denote_suggest_parent' ranks nodes by tag overlap and proposes a child slot."
+  (test-mcpkit--with-temp-denote
+    (let ((denote-sequence-scheme 'alphanumeric))
+      (test-denote-mcp--note "Topic root" :keywords ["casap" "plan"] :sequence "1")
+      (test-denote-mcp--note "Topic child" :keywords ["casap"] :sequence "1a")
+      (test-denote-mcp--note "Other" :keywords ["knitting"] :sequence "2")
+      (let* ((res (test-denote-mcp--call "denote_suggest_parent" :tags ["casap" "plan"] :top_n 3))
+             (top (car res)))
+        (should (equal (plist-get top :sequence) "1"))
+        (should (= 1 (plist-get top :child_count)))
+        (should (equal (plist-get top :next_sequence) "1b"))
+        (should (equal ["Topic child"] (plist-get top :sample_children)))
+        (should-not (seq-find (lambda (r) (equal (plist-get r :sequence) "2")) res))))))
+
+;;; Redate across the enclosing repository
+
+(ert-deftest test-denote-mcp/redate-scope-repo-rewrites-non-note-files ()
+  "`denote_redate' with scope=repo also rewrites git-tracked non-note files."
+  (skip-unless (executable-find "git"))
+  (test-mcpkit--with-temp-denote
+    (let* ((default-directory temp-dir)
+           (note (test-denote-mcp--note "Linked" :date "2026-01-01"))
+           (old-id (plist-get (test-denote-mcp--call "denote_get_metadata" :file_or_slug note) :id))
+           (other (expand-file-name "tracker.org" temp-dir)))
+      (with-temp-file other (insert (format "see [[denote:%s][Linked]]\n" old-id)))
+      (process-file "git" nil nil nil "init" "-q")
+      (process-file "git" nil nil nil "add" "tracker.org")
+      (let ((res (test-denote-mcp--call "denote_redate" :file_or_slug "linked"
+                                        :new_identifier "20250505T050505" :scope "repo")))
+        (should (> (plist-get res :links_updated) 0)))
+      (with-temp-buffer
+        (insert-file-contents other)
+        (should (string-search "[[denote:20250505T050505]" (buffer-string)))))))
+
+;;; Authorship search
+
+(ert-deftest test-denote-mcp/find-authorship-earliest-commit ()
+  "`denote_find_authorship' returns the oldest commit that added a phrase."
+  (skip-unless (executable-find "git"))
+  (test-mcpkit--with-temp-denote
+    (let ((default-directory temp-dir))
+      (process-file "git" nil nil nil "init" "-q")
+      (process-file "git" nil nil nil "config" "user.email" "t@example.com")
+      (process-file "git" nil nil nil "config" "user.name" "t")
+      (with-temp-file (expand-file-name "a.org" temp-dir) (insert "a unique-xyzzy phrase\n"))
+      (process-file "git" nil nil nil "add" ".")
+      (process-file "git" nil nil nil "commit" "-q" "-m" "first")
+      (with-temp-file (expand-file-name "b.org" temp-dir) (insert "copied unique-xyzzy phrase\n"))
+      (process-file "git" nil nil nil "add" ".")
+      (process-file "git" nil nil nil "commit" "-q" "-m" "second")
+      (let ((hit (test-denote-mcp--call "denote_find_authorship" :phrase "unique-xyzzy" :show t)))
+        (should (eq t (plist-get hit :found)))
+        (should (equal "first" (plist-get hit :subject)))
+        (should (string-search "unique-xyzzy" (plist-get hit :excerpt))))
+      (should (eq :json-false (plist-get (test-denote-mcp--call "denote_find_authorship"
+                                                                :phrase "never-written")
+                                         :found))))))
 
 (provide 'test-denote-mcp)
 ;;; test-denote-mcp.el ends here
