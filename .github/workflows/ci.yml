@@ -26,6 +26,9 @@ jobs:
 
       - name: Lint Source Code
         uses: tychoish/elisp-ci/lint@v0.1.3
+        with:
+          linters: "byte-compile checkdoc package-lint"
+          required-linters: "byte-compile checkdoc package-lint"
 
       - name: Install Markdown tree-sitter grammars
         shell: bash

@@ -105,9 +105,9 @@ When nil the tools use the ambient `denote-sequence-scheme'; only
 
 (defconst denote-mcp--filename-rx
   (rx bos (group (= 8 digit) "T" (= 6 digit))
-      (? "==" (group (+ (not (any "-_.")))))
-      (? "--" (group (* (not (any "_.")))))
-      (? "__" (group (* (not (any "."))))) "." (group (+ nonl)) eos)
+      (? "==" (group (+ (not (in "-_.")))))
+      (? "--" (group (* (not (in "_.")))))
+      (? "__" (group (* (not (in "."))))) "." (group (+ nonl)) eos)
   "Match a standard denote file name: ID, signature, slug, keywords, extension.")
 
 (defun denote-mcp--note-from-path (file)
