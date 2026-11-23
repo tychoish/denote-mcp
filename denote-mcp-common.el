@@ -7,6 +7,8 @@
 
 ;;; Code:
 
+(require 'org)
+(require 'org-element)
 (require 'denote)
 (require 'denote-mcp)
 
@@ -141,31 +143,36 @@ parent carries TAGS; an unused exact signature is assigned as given."
   "Answer QUESTION-TITLE in the current buffer with ANSWER-TEXT.
 Switch the heading to NEW-STATE (default \"ANSWERED\") and log the
 transition and answer in its :LOGBOOK: drawer.  Does not save."
-  (let ((state (or new-state "ANSWERED")))
+  (let ((state (or new-state "ANSWERED"))
+        found)
     (save-excursion
-      (goto-char (point-min))
-      (unless (re-search-forward (concat "^\\*+\\s-+\\(?:QUESTION\\|TODO\\|INPROGRESS\\|BLOCKED\\)?\\s-*"
-                                         (regexp-quote question-title))
-                                 nil t)
+      (org-map-entries
+       (lambda ()
+         (when (and (not found)
+                    (equal (org-get-heading t t t t) question-title))
+           (setq found (point))))
+       nil 'file)
+      (unless found
         (error "Question heading %S not found" question-title))
+      (goto-char found)
       (org-back-to-heading t)
-      (when (looking-at "^\\(\\*+\\)\\s-+\\(?:[A-Z]+\\s-+\\)?\\(.*\\)$")
-        (replace-match (concat "\\1 " state " \\2")))
-      (let* ((log-entry (format "- State \"%-12s\" from \"QUESTION\"   %s \\\\\n  %s\n"
-                                state (format-time-string "[%Y-%m-%d %a %H:%M]")
-                                answer-text))
-             (bound (save-excursion (outline-next-heading) (point)))
-             (drawer (save-excursion
-                       (forward-line 1)
-                       (and (re-search-forward "^:LOGBOOK:" bound t)
-                            (match-beginning 0)))))
-        (if drawer
-            (save-excursion
-              (goto-char drawer)
-              (forward-line 1)
-              (insert log-entry))
-          (forward-line 1)
-          (insert ":LOGBOOK:\n" log-entry ":END:\n"))))
+      (org-todo state)
+      (let ((log-entry (format "- State \"%-12s\" from \"QUESTION\"   %s \\\\\n  %s\n"
+                               state (format-time-string "[%Y-%m-%d %a %H:%M]")
+                               answer-text)))
+        (save-restriction
+          (org-narrow-to-subtree)
+          (let ((log-drawer (org-element-map (org-element-parse-buffer) 'drawer
+                              (lambda (d)
+                                (when (equal (org-element-property :drawer-name d) "LOGBOOK")
+                                  d))
+                              nil t)))
+            (if log-drawer
+                (progn
+                  (goto-char (org-element-property :contents-begin log-drawer))
+                  (insert log-entry))
+              (org-end-of-meta-data nil)
+              (insert ":LOGBOOK:\n" log-entry ":END:\n"))))))
     state))
 
 ;;;###autoload

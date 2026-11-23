@@ -77,12 +77,13 @@ predates this function's introduction and was never captured)."
 (defun denote-mcp-tracker--existing-ids (file)
   "Return every :ID: value present on a task heading in FILE, as strings."
   (with-current-buffer (find-file-noselect file)
-    (save-excursion
-      (goto-char (point-min))
-      (let (ids)
-        (while (re-search-forward "^[ \t]*:ID:[ \t]+\\(\\S-+\\)[ \t]*$" nil t)
-          (push (match-string-no-properties 1) ids))
-        ids))))
+    (let (ids)
+      (org-map-entries
+       (lambda ()
+         (when-let* ((id (org-entry-get (point) "ID")))
+           (push id ids)))
+       nil 'file)
+      (nreverse ids))))
 
 ;;;###autoload
 (defun denote-mcp-tracker-next-id (file proposed-slug)
@@ -108,11 +109,13 @@ this assumes."
 Signals an error if not found. Returns the buffer."
   (let ((buf (find-file-noselect file)))
     (with-current-buffer buf
-      (goto-char (point-min))
-      (unless (re-search-forward (format "^[ \t]*:ID:[ \t]+%s[ \t]*$" (regexp-quote id)) nil t)
-        (error "Task ID %S not found in %s" id file))
-      (org-back-to-heading t)
-      buf)))
+      (let ((pos (or (org-find-property "ID" id)
+                     (org-find-property "CUSTOM_ID" id))))
+        (unless pos
+          (error "Task ID %S not found in %s" id file))
+        (goto-char pos)
+        (org-back-to-heading t)
+        buf))))
 
 ;;; ─── Adding a task ───────────────────────────────────────────────────────────
 
@@ -121,31 +124,46 @@ Signals an error if not found. Returns the buffer."
 `* Tasks', creating both `* Tasks' and the category heading if either
 is missing. Point ends at the end of the category's subtree, ready for
 a new `***' child to be inserted."
-  (goto-char (point-min))
-  (unless (re-search-forward "^\\* Tasks[ \t]*$" nil t)
-    (goto-char (point-max))
-    (unless (bolp) (insert "\n"))
-    (insert "\n* Tasks\n")
-    (goto-char (point-max)))
-  (let ((tasks-end (save-excursion
-                      (if (re-search-forward "^\\* [^*]" nil t)
-                          (match-beginning 0)
-                        (point-max)))))
-    (goto-char (point-min))
-    (re-search-forward "^\\* Tasks[ \t]*$")
-    (if (re-search-forward (format "^\\*\\* %s[ \t]*$" (regexp-quote category)) tasks-end t)
-        (progn
-          (org-end-of-subtree t t)
-          (skip-chars-backward " \t\n")
-          (end-of-line))
-      ;; Not found: append a new category heading just before the next
-      ;; top-level heading (or EOF), so trackers read top-to-bottom in
-      ;; the order categories were introduced.
-      (goto-char tasks-end)
+  (let ((tasks-pos (save-excursion
+                     (let (pos)
+                       (org-map-entries
+                        (lambda ()
+                          (when (and (not pos)
+                                     (= (org-current-level) 1)
+                                     (equal (org-get-heading t t t t) "Tasks"))
+                            (setq pos (point))))
+                        nil 'file)
+                       pos))))
+    (unless tasks-pos
+      (goto-char (point-max))
       (unless (bolp) (insert "\n"))
-      (insert (format "** %s\n" category))
-      (forward-line -1)
-      (end-of-line))))
+      (insert "\n* Tasks\n")
+      (setq tasks-pos (line-beginning-position)))
+    (let ((category-pos
+           (save-excursion
+             (goto-char tasks-pos)
+             (let ((end (save-excursion (org-end-of-subtree t t)))
+                   pos)
+               (while (and (not pos)
+                           (outline-next-heading)
+                           (< (point) end))
+                 (when (and (= (org-current-level) 2)
+                            (equal (org-get-heading t t t t) category))
+                   (setq pos (line-beginning-position))))
+               pos))))
+      (if category-pos
+          (progn
+            (goto-char category-pos)
+            (org-end-of-subtree t t)
+            (skip-chars-backward " \t\n")
+            (end-of-line))
+        ;; Not found: append a new category heading at the end of * Tasks subtree
+        (goto-char tasks-pos)
+        (org-end-of-subtree t t)
+        (unless (bolp) (insert "\n"))
+        (insert (format "** %s\n" category))
+        (forward-line -1)
+        (end-of-line)))))
 
 ;;;###autoload
 (defun denote-mcp-tracker-add-task (file category id title &optional status priority props body)
@@ -213,27 +231,20 @@ Returns the absolute file path."
   (let ((label (or label "Result"))
         (timestamp (format-time-string "[%Y-%m-%d %a %H:%M]")))
     (with-current-buffer (denote-mcp-tracker--find-task file id)
-      (let ((heading-end (save-excursion (outline-next-heading) (point))))
-        (forward-line 1)
-        (when (looking-at "^[ \t]*:PROPERTIES:")
-          (re-search-forward "^[ \t]*:END:$" heading-end t)
-          (forward-line 1))
-        ;; Skip to the end of this task's own body, i.e. just before its
-        ;; first child heading (one or more `*' deeper) or the end of its
-        ;; subtree if it has no children -- so the new bullet always lands
-        ;; as the last line of THIS task's own prose.
-        (let ((body-end (save-excursion
-                           (if (re-search-forward "^\\*+ " heading-end t)
-                               (match-beginning 0)
-                             heading-end))))
-          (goto-char body-end)
-          (skip-chars-backward " \t\n")
-          (end-of-line)
-          (insert (format "\n- *%s%s*: %s"
-                           label
-                           (if (string= label "Status") (format " %s" timestamp) "")
-                           text))
-          (unless (looking-at-p "\n") (insert "\n"))))
+      (let* ((head (point))
+             (end (save-excursion
+                    (end-of-line)
+                    (if (outline-next-heading) (point) (point-max)))))
+        (goto-char end)
+        (when (and (eobp) (not (bolp))) (insert "\n"))
+        ;; Sit after existing body text but before trailing blank lines.
+        (skip-chars-backward " \t\n" head)
+        (end-of-line)
+        (insert (format "\n- *%s%s*: %s"
+                        label
+                        (if (string= label "Status") (format " %s" timestamp) "")
+                        text))
+        (unless (looking-at-p "\n") (insert "\n")))
       (save-buffer)
       (buffer-file-name))))
 
@@ -248,18 +259,7 @@ itself never changes; it is the stable handle callers keep using.
 
 Returns the absolute file path."
   (with-current-buffer (denote-mcp-tracker--find-task file id)
-    (if (looking-at "^\\(\\*+\\)\\(?:[ \t]+\\([A-Z]+\\)\\)?\\(?:[ \t]+\\(\\[#[A-C]\\]\\)\\)?[ \t]+\\(.*?\\)\\([ \t]+:[[:alnum:]:_@#%%]+:\\)?[ \t]*$")
-        (let ((stars (match-string 1))
-              (kw (match-string 2))
-              (prio (match-string 3))
-              (tags (match-string 5)))
-          (replace-match
-           (concat stars
-                   (when kw (concat " " kw))
-                   (when prio (concat " " prio))
-                   " " new-title
-                   (when tags (concat " " tags)))))
-      (error "Could not parse heading line for task %S in %s" id file))
+    (org-edit-headline new-title)
     (save-buffer)
     (buffer-file-name)))
 

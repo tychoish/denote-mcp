@@ -25,8 +25,10 @@
 ;;; Code:
 
 (require 'org)
+(require 'org-element)
 (require 'org-table)
 (require 'cl-lib)
+(require 'map)
 
 (require 'denote-mcp-common)
 
@@ -37,14 +39,21 @@
 Point is left undefined; search always starts from `point-min'."
   (save-excursion
     (goto-char (point-min))
-    (unless (re-search-forward "^\\* Execution Plan" nil t)
-      (error "No \"* Execution Plan\" heading found"))
-    (unless (re-search-forward "^|" nil t)
-      (error "No table found under \"* Execution Plan\""))
-    (beginning-of-line)
-    (let ((beg (point)))
-      (while (looking-at "^|") (forward-line 1))
-      (cons beg (point)))))
+    (let (table-bounds)
+      (org-map-entries
+       (lambda ()
+         (when (and (not table-bounds)
+                    (equal (org-get-heading t t t t) "Execution Plan"))
+           (save-restriction
+             (org-narrow-to-subtree)
+             (let ((tbl (org-element-map (org-element-parse-buffer) 'table
+                          #'identity nil t)))
+               (when tbl
+                 (setq table-bounds (cons (org-element-property :begin tbl)
+                                          (org-element-property :end tbl))))))))
+       nil 'file)
+      (or table-bounds
+          (error "No table found under \"* Execution Plan\"")))))
 
 (defun denote-mcp-plan--status-column (table-beg)
   "Return the 1-based column index of the Status column in the table at TABLE-BEG."
@@ -74,21 +83,32 @@ file path."
 
 ;;; ─── In-flight notes ─────────────────────────────────────────────────────────
 
-(defun denote-mcp-plan--append-note-here (heading-regexp text)
-  "Insert TEXT as a paragraph under the heading matching HEADING-REGEXP.
+(defun denote-mcp-plan--append-note-here (heading-target text)
+  "Insert TEXT as a paragraph under the heading matching HEADING-TARGET.
+HEADING-TARGET may be a string heading title or a regexp.
 Operates on the current buffer without saving."
   (save-excursion
-    (goto-char (point-min))
-    (unless (re-search-forward heading-regexp nil t)
-      (error "Heading matching %S not found" heading-regexp))
-    (org-back-to-heading t)
-    (let ((heading-end (save-excursion (outline-next-heading) (point))))
-      (forward-line 1)
-      (while (and (< (point) heading-end) (looking-at "^:[A-Za-z_]+:$"))
-        (re-search-forward "^:END:$" heading-end t)
-        (forward-line 1))
+    (let (found)
+      (org-map-entries
+       (lambda ()
+         (when (and (not found)
+                    (let ((title (org-get-heading t t t t))
+                          (line (buffer-substring-no-properties (line-beginning-position) (line-end-position))))
+                      (or (equal title heading-target)
+                          (and (stringp heading-target)
+                               (or (string-match-p heading-target title)
+                                   (string-match-p heading-target line))))))
+           (setq found (point))))
+       nil 'file)
+      (unless found
+        (error "Heading matching %S not found" heading-target))
+      (goto-char found)
+      (org-back-to-heading t)
+      (org-end-of-meta-data t)
       (unless (bolp) (insert "\n"))
-      (unless (looking-back "\n\n" (- (point) 2)) (insert "\n"))
+      (unless (and (>= (point) (+ (point-min) 2))
+                   (string= (buffer-substring-no-properties (- (point) 2) (point)) "\n\n"))
+        (insert "\n"))
       (insert text)
       (unless (bolp) (insert "\n")))))
 
@@ -150,15 +170,13 @@ Returns the absolute file path."
   "Return a hash of :CUSTOM_ID:/:ID: value -> marker at its heading.
 One scan of the buffer, so any number of lookups costs a single parse."
   (let ((tbl (make-hash-table :test #'equal)))
-    (save-excursion
-      (goto-char (point-min))
-      (while (re-search-forward
-              "^[ \t]*:\\(?:CUSTOM_\\)?ID:[ \t]+\\(\\S-+\\)[ \t]*$" nil t)
-        (let ((id (match-string-no-properties 1)))
-          (unless (gethash id tbl)
-            (save-excursion
-              (when (ignore-errors (org-back-to-heading t) t)
-                (puthash id (copy-marker (point)) tbl)))))))
+    (org-map-entries
+     (lambda ()
+       (when-let* ((id (or (org-entry-get (point) "CUSTOM_ID")
+                           (org-entry-get (point) "ID"))))
+         (unless (map-elt tbl id)
+           (setf (map-elt tbl id) (point-marker)))))
+     nil 'file)
     tbl))
 
 (defun denote-mcp-plan--apply-transitions (transitions)
@@ -168,10 +186,10 @@ the note half updated.  Re-derive the Execution Plan table's Status
 cells from the headings afterwards.  Return the number applied."
   (let ((tbl (denote-mcp-plan--id-table)))
     (dolist (tr transitions)
-      (unless (gethash (car tr) tbl)
+      (unless (map-elt tbl (car tr))
         (error "ID %S not found" (car tr))))
     (dolist (tr transitions)
-      (goto-char (gethash (car tr) tbl))
+      (goto-char (map-elt tbl (car tr)))
       (org-todo (cdr tr)))
     (denote-mcp-plan--sync-table transitions)
     (length transitions)))
@@ -187,7 +205,8 @@ directly and align once; do nothing when the note has no table."
            (beg (copy-marker (car bounds)))
            (end (copy-marker (cdr bounds)))
            (changed nil))
-      (dolist (tr transitions) (puthash (car tr) (cdr tr) want))
+      (dolist (tr transitions)
+        (setf (map-elt want (car tr)) (cdr tr)))
       (save-excursion
         (goto-char beg)
         (forward-line 2)                ; header row and separator
@@ -199,7 +218,7 @@ directly and align once; do nothing when the note has no table."
                  (task (nth 1 cells)))
             (when (and task (> (length cells) (1+ col))
                        (string-match "#\\([^]]+\\)\\]" task))
-              (when-let* ((st (gethash (match-string 1 task) want)))
+              (when-let* ((st (map-elt want (match-string 1 task))))
                 (setf (nth col cells) (format " %s " st))
                 (delete-region (line-beginning-position) (line-end-position))
                 (insert (mapconcat #'identity cells "|"))
@@ -250,16 +269,14 @@ Works on plans and trackers alike.  Returns the absolute file path."
 Question headings (QUESTION, ANSWERED, IGNORED or tagged :question:) are
 not tasks."
   (let ((total 0) (open 0))
-    (save-excursion
-      (goto-char (point-min))
-      (while (re-search-forward "^\\*+ +\\([A-Z]+\\)\\_>.*$" nil t)
-        (let ((kw (match-string-no-properties 1)))
-          (when (and (member kw org-todo-keywords-1)
-                     (not (member kw '("QUESTION" "ANSWERED" "IGNORED")))
-                     (not (string-match-p ":question:" (match-string 0))))
-            (cl-incf total)
-            (unless (member kw org-done-keywords)
-              (cl-incf open))))))
+    (org-map-entries
+     (lambda ()
+       (when-let* ((kw (org-get-todo-state)))
+         (unless (or (member kw '("QUESTION" "ANSWERED" "IGNORED"))
+                     (member "question" (org-get-tags nil t)))
+           (cl-incf total)
+           (unless (member kw org-done-keywords)
+             (cl-incf open))))))
     (cons total open)))
 
 (defun denote-mcp-plan--plan-p (file)
@@ -327,15 +344,13 @@ of status to number)."
            (deps (make-hash-table :test #'equal))
            (order nil))
       ;; Heading state: one scan.
-      (save-excursion
-        (goto-char (point-min))
-        (while (re-search-forward
-                "^[ \t]*:\\(?:CUSTOM_\\)?ID:[ \t]+\\(\\S-+\\)[ \t]*$" nil t)
-          (let ((id (match-string-no-properties 1)))
-            (save-excursion
-              (when (ignore-errors (org-back-to-heading t) t)
-                (puthash id (or (org-get-todo-state) "") status)
-                (puthash id (org-get-heading t t t t) title))))))
+      (org-map-entries
+       (lambda ()
+         (when-let* ((id (or (org-entry-get (point) "CUSTOM_ID")
+                             (org-entry-get (point) "ID"))))
+           (setf (map-elt status id) (or (org-get-todo-state) ""))
+           (setf (map-elt title id) (org-get-heading t t t t))))
+       nil 'file)
       ;; Table: order and dependencies.
       (save-excursion
         (goto-char (car bounds))
@@ -353,29 +368,30 @@ of status to number)."
                   (push (match-string 1 dep) ds)
                   (setq start (match-end 0)))
                 (push id order)
-                (puthash id (nreverse ds) deps))))
+                (setf (map-elt deps id) (nreverse ds)))))
           (forward-line 1)))
       (setq order (nreverse order))
       (let ((round (make-hash-table :test #'equal))
-            (done (lambda (id) (member (gethash id status) org-done-keywords))))
+            (done (lambda (id) (member (map-elt status id) org-done-keywords))))
         (cl-labels ((round-of (id)
-                      (or (gethash id round)
+                      (or (map-elt round id)
                           (progn
                             ;; Seed so a dependency cycle terminates.
-                            (puthash id 1 round)
-                            (puthash id (1+ (apply #'max 0 (mapcar #'round-of
-                                                                    (gethash id deps))))
-                                     round)))))
+                            (setf (map-elt round id) 1)
+                            (setf (map-elt round id)
+                                  (1+ (apply #'max 0 (mapcar #'round-of
+                                                             (map-elt deps id)))))
+                            (map-elt round id)))))
           (let ((rounds nil) (ready nil) (counts nil))
             (dolist (id order)
-              (let ((r (round-of id)) (st (gethash id status "")))
+              (let ((r (round-of id)) (st (or (map-elt status id) "")))
                 (if-let* ((cell (assq r rounds)))
                     (setcdr cell (append (cdr cell) (list id)))
                   (setq rounds (append rounds (list (list r id)))))
                 (cl-incf (alist-get st counts 0 nil #'equal))
                 (when (and (not (funcall done id))
-                           (cl-every done (gethash id deps)))
-                  (push (list :id id :title (gethash id title "") :status st)
+                           (cl-every done (map-elt deps id)))
+                  (push (list :id id :title (or (map-elt title id) "") :status st)
                         ready))))
             (list :ready (nreverse ready)
                   :rounds (mapcar (lambda (c) (list :round (car c) :ids (cdr c)))
@@ -390,16 +406,26 @@ of status to number)."
 (defun denote-mcp-plan-sweep-open-questions (file)
   "Move any remaining open QUESTION or IGNORED headings in FILE to ANSWERED."
   (with-current-buffer (find-file-noselect file)
-    (save-excursion
-      (goto-char (point-min))
-      (while (re-search-forward "^\\(\\*+\\)\\s-+\\(?:QUESTION\\|IGNORED\\)\\s-+\\(.*\\)$" nil t)
-        (replace-match "\\1 ANSWERED \\2")
-        (save-excursion
-          (forward-line 1)
-          (unless (looking-at-p "^[ \t]*:LOGBOOK:")
-            (insert ":LOGBOOK:\n- State \"ANSWERED\" from \"QUESTION\" "
-                    (format-time-string "[%Y-%m-%d %a %H:%M]")
-                    " \\\\\n  Resolved upon plan completion.\n:END:\n")))))
+    (org-map-entries
+     (lambda ()
+       (when (member (org-get-todo-state) '("QUESTION" "IGNORED"))
+         (org-todo "ANSWERED")
+         (save-restriction
+           (org-narrow-to-subtree)
+           (let* ((log-drawer (org-element-map (org-element-parse-buffer) 'drawer
+                                (lambda (d)
+                                  (when (equal (org-element-property :drawer-name d) "LOGBOOK")
+                                    d))
+                                nil t))
+                  (log-entry (format "- State \"ANSWERED\" from \"QUESTION\" %s \\\\\n  Resolved upon plan completion.\n"
+                                     (format-time-string "[%Y-%m-%d %a %H:%M]"))))
+             (if log-drawer
+                 (progn
+                   (goto-char (org-element-property :contents-begin log-drawer))
+                   (insert log-entry))
+               (org-end-of-meta-data nil)
+               (insert ":LOGBOOK:\n" log-entry ":END:\n"))))))
+     nil 'file)
     (save-buffer)))
 
 ;;;###autoload
