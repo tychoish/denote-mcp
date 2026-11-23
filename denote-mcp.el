@@ -1232,6 +1232,31 @@ With KEYWORD-ONLY, ARGS use `set' instead of `new_keywords' and no title."
 (defconst denote-mcp--category-body-threshold 600
   "Body size in characters under which a note with children counts as a category.")
 
+(defconst denote-mcp--stop-words
+  '("a" "about" "above" "after" "again" "against" "all" "an" "and" "any" "are"
+    "as" "at" "be" "because" "been" "before" "being" "below" "between" "both"
+    "but" "by" "can" "did" "do" "does" "doing" "don" "down" "during" "each"
+    "few" "for" "from" "further" "had" "has" "have" "having" "here" "how"
+    "if" "in" "into" "is" "it" "its" "just" "more" "most" "no" "nor" "not"
+    "now" "of" "off" "on" "once" "only" "or" "other" "our" "out" "over" "own"
+    "s" "same" "should" "so" "some" "such" "t" "than" "that" "the" "their"
+    "theirs" "them" "then" "there" "these" "they" "this" "those" "through"
+    "to" "too" "under" "until" "up" "very" "was" "we" "were" "what" "when"
+    "where" "which" "while" "who" "whom" "why" "will" "with")
+  "Common stop words filtered out during title-word matching.")
+
+(defun denote-mcp--title-words (string)
+  "Return a list of distinctive words extracted from STRING (title or slug).
+Lowercases and splits on non-alphanumeric characters, filtering out
+common stop words and single-character words."
+  (when (and string (stringp string))
+    (let* ((raw-words (split-string (downcase string) "[^[:alnum:]]+" t))
+           (words (seq-filter (lambda (w)
+                                (and (> (length w) 1)
+                                     (not (member w denote-mcp--stop-words))))
+                              raw-words)))
+      (or words (seq-filter (lambda (w) (> (length w) 1)) raw-words)))))
+
 (defun denote-mcp--body-size (file)
   "Return the size of FILE past its leading #+ front matter block."
   (with-temp-buffer
@@ -1240,11 +1265,15 @@ With KEYWORD-ONLY, ARGS use `set' instead of `new_keywords' and no title."
     (while (looking-at "^#\\+") (forward-line 1))
     (- (point-max) (point))))
 
-(defun denote-mcp-suggest-parent (tags &optional top-n)
+(defun denote-mcp-suggest-parent (tags &optional top-n title)
   "Rank sequence nodes as candidate parents for a new note tagged TAGS.
 Score is overlap with the node's own tags plus half the overlap with the tags
 of all its descendants; ties go to the node with more descendants.  Return up
 to TOP-N (default 5) plists.
+
+When TAGS overlap is zero across all candidates (e.g. no tag matches or tags
+are empty) and TITLE is non-nil, falls back to scoring by word overlap between
+TITLE and each node's title (and half-weighted descendant titles).
 
 The index is built from file names only.  Descendants are found in one pass
 over the sorted sequences (a node's subtree is the contiguous run after it),
@@ -1257,25 +1286,52 @@ and files are read only for the winners."
                              (lambda (a b) (string< (denote-mcp--note-seq a)
                                                     (denote-mcp--note-seq b))))))
          (n (length vec))
-         (scored nil))
-    (dotimes (i n)
-      (let* ((node (aref vec i))
-             (seq (denote-mcp--note-seq node))
-             (j (1+ i))
-             (child-tags nil)
-             (count 0)
-             (sample nil))
-        (while (and (< j n) (string-prefix-p seq (denote-mcp--note-seq (aref vec j))))
-          (let ((child (aref vec j)))
-            (unless (equal (denote-mcp--note-seq child) seq)
-              (cl-incf count)
-              (when (< (length sample) 3) (push child sample))
-              (dolist (k (denote-mcp--note-keywords child)) (cl-pushnew k child-tags :test #'equal))))
-          (cl-incf j))
-        (let ((overlap (+ (length (cl-intersection tagset (denote-mcp--note-keywords node) :test #'equal))
-                          (* 0.5 (length (cl-intersection tagset child-tags :test #'equal))))))
-          (when (> overlap 0)
-            (push (list :node node :overlap overlap :count count :sample (nreverse sample)) scored)))))
+         (scored nil)
+         (fallback-used nil))
+    (when tagset
+      (dotimes (i n)
+        (let* ((node (aref vec i))
+               (seq (denote-mcp--note-seq node))
+               (j (1+ i))
+               (child-tags nil)
+               (count 0)
+               (sample nil))
+          (while (and (< j n) (string-prefix-p seq (denote-mcp--note-seq (aref vec j))))
+            (let ((child (aref vec j)))
+              (unless (equal (denote-mcp--note-seq child) seq)
+                (cl-incf count)
+                (when (< (length sample) 3) (push child sample))
+                (dolist (k (denote-mcp--note-keywords child)) (cl-pushnew k child-tags :test #'equal))))
+            (cl-incf j))
+          (let ((overlap (+ (length (cl-intersection tagset (denote-mcp--note-keywords node) :test #'equal))
+                            (* 0.5 (length (cl-intersection tagset child-tags :test #'equal))))))
+            (when (> overlap 0)
+              (push (list :node node :overlap overlap :count count :sample (nreverse sample)) scored))))))
+    ;; Title-word fallback: activate only when tag overlap is zero across all candidates
+    (when (and (null scored) title (stringp title))
+      (let ((query-words (denote-mcp--title-words title)))
+        (when query-words
+          (setq fallback-used t)
+          (dotimes (i n)
+            (let* ((node (aref vec i))
+                   (seq (denote-mcp--note-seq node))
+                   (j (1+ i))
+                   (child-words nil)
+                   (count 0)
+                   (sample nil)
+                   (node-words (denote-mcp--title-words (denote-mcp--note-slug node))))
+              (while (and (< j n) (string-prefix-p seq (denote-mcp--note-seq (aref vec j))))
+                (let ((child (aref vec j)))
+                  (unless (equal (denote-mcp--note-seq child) seq)
+                    (cl-incf count)
+                    (when (< (length sample) 3) (push child sample))
+                    (dolist (w (denote-mcp--title-words (denote-mcp--note-slug child)))
+                      (cl-pushnew w child-words :test #'equal))))
+                (cl-incf j))
+              (let ((overlap (+ (length (cl-intersection query-words node-words :test #'equal))
+                                (* 0.5 (length (cl-intersection query-words child-words :test #'equal))))))
+                (when (> overlap 0)
+                  (push (list :node node :overlap overlap :count count :sample (nreverse sample)) scored))))))))
     (let ((top (seq-take
                 (sort scored
                       (lambda (a b)
@@ -1293,6 +1349,7 @@ and files are read only for the winners."
                    :title (denote-mcp--title file (denote-mcp--note-slug node))
                    :path file
                    :overlap (plist-get r :overlap)
+                   :fallback (if fallback-used t :json-false)
                    :category (if (and (> (plist-get r :count) 0)
                                       (< (denote-mcp--body-size file) denote-mcp--category-body-threshold))
                                  t :json-false)
@@ -1303,12 +1360,15 @@ and files are read only for the winners."
          top)))))
 
 (mcpkit-register-tool 'denote_suggest_parent 'denote
-  :description "Rank existing sequence nodes as candidate parents for a new note by tag overlap (own tags plus half-weighted descendant tags). Each result has next_sequence ready for denote_seq_set or denote_create_note."
+  :description "Rank existing sequence nodes as candidate parents for a new note by tag overlap (own tags plus half-weighted descendant tags). When tag overlap across all candidates is zero and title is provided, falls back to title word overlap. Each result has next_sequence ready for denote_seq_set or denote_create_note."
   :input-schema '(:type "object"
                   :properties (:tags (:type "array" :items (:type "string") :description "Tags of the new note")
-                               :top_n (:type "integer" :description "Max candidates (default 5)"))
+                               :top_n (:type "integer" :description "Max candidates (default 5)")
+                               :title (:type "string" :description "Optional title of the new note for fallback matching when tag overlap is zero"))
                   :required ["tags"])
-  (denote-mcp-suggest-parent (denote-mcp--list (plist-get args :tags)) (plist-get args :top_n)))
+  (denote-mcp-suggest-parent (denote-mcp--list (plist-get args :tags))
+                             (plist-get args :top_n)
+                             (plist-get args :title)))
 
 ;; 21. denote_find_authorship
 (defun denote-mcp-find-authorship (phrase &optional pathspecs show)

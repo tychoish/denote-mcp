@@ -662,6 +662,54 @@
         (should (equal ["Topic child"] (plist-get top :sample_children)))
         (should-not (seq-find (lambda (r) (equal (plist-get r :sequence) "2")) res))))))
 
+(ert-deftest test-denote-mcp/suggest-parent-title-fallback ()
+  "`denote_suggest_parent' falls back to title word overlap when tag overlap is zero."
+  (test-mcpkit--with-temp-denote
+    (let ((denote-sequence-scheme 'alphanumeric))
+      (test-denote-mcp--note "Service Architecture 2.0" :keywords ["architecture"] :sequence "1")
+      (test-denote-mcp--note "Data Ingestion Pipeline" :keywords ["pipeline"] :sequence "1a")
+      (test-denote-mcp--note "Knitting Sweaters" :keywords ["knitting"] :sequence "2")
+      ;; Query with tags that match nothing, but title matches "Architecture" and child "Ingestion"
+      (let* ((res (test-denote-mcp--call "denote_suggest_parent"
+                                         :tags ["unrelated" "tag"]
+                                         :title "Service Ingestion Design"
+                                         :top_n 3))
+             (top (car res)))
+        (should top)
+        (should (equal (plist-get top :sequence) "1"))
+        (should (equal (plist-get top :fallback) t))
+        ;; Overlap is 1.0 (own title "service") + 0.5 (child title "ingestion") = 1.5
+        (should (= (plist-get top :overlap) 1.5))
+        (should (equal (plist-get top :next_sequence) "1b"))
+        ;; No match for "Knitting Sweaters"
+        (should-not (seq-find (lambda (r) (equal (plist-get r :sequence) "2")) res))))))
+
+(ert-deftest test-denote-mcp/suggest-parent-tag-match-beats-title ()
+  "`denote_suggest_parent' never activates title fallback when tag overlap is positive."
+  (test-mcpkit--with-temp-denote
+    (let ((denote-sequence-scheme 'alphanumeric))
+      (test-denote-mcp--note "Machine Learning Models" :keywords ["ai" "model"] :sequence "1")
+      (test-denote-mcp--note "Distributed Architecture" :keywords ["infra"] :sequence "2")
+      ;; Query matches Node 1 by tag, but title contains words from Node 2 ("Distributed Architecture")
+      (let* ((res (test-denote-mcp--call "denote_suggest_parent"
+                                         :tags ["ai"]
+                                         :title "Distributed Architecture Survey"
+                                         :top_n 3))
+             (top (car res)))
+        (should top)
+        ;; Node 1 must win because of tag overlap; fallback was NOT triggered
+        (should (equal (plist-get top :sequence) "1"))
+        (should (equal (plist-get top :fallback) :json-false))
+        (should-not (seq-find (lambda (r) (equal (plist-get r :sequence) "2")) res))))))
+
+(ert-deftest test-denote-mcp/suggest-parent-zero-overlap-returns-nil ()
+  "`denote_suggest_parent' returns nil when neither tags nor title match."
+  (test-mcpkit--with-temp-denote
+    (let ((denote-sequence-scheme 'alphanumeric))
+      (test-denote-mcp--note "Knitting Sweaters" :keywords ["knitting"] :sequence "1")
+      (should-not (test-denote-mcp--call "denote_suggest_parent" :tags ["casap"]))
+      (should-not (test-denote-mcp--call "denote_suggest_parent" :tags ["casap"] :title "Completely Unrelated")))))
+
 ;;; Redate across the enclosing repository
 
 (ert-deftest test-denote-mcp/redate-scope-repo-rewrites-non-note-files ()
